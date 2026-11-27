@@ -114,8 +114,9 @@ class AnnouncementsSaveRequest(BaseModel):
 
 class AsrStartRequest(BaseModel):
     mode: str = Field(default="new_only", pattern="^(new_only|retranscribe_legacy)$")
-    processes: int = Field(default=1, ge=1, le=3)
-    batch_size: int = Field(default=8, ge=1, le=32)
+    processes: int = Field(default=3, ge=1, le=4)
+    batch_size: int = Field(default=12, ge=1, le=32)
+    beam_size: int = Field(default=1, ge=1, le=5)
     limit: int = Field(default=0, ge=0, le=5000)
 
 
@@ -532,11 +533,15 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
         env["PYTHONIOENCODING"] = "utf-8"
 
         py = sys.executable
-        n_procs = max(1, min(3, int(body.processes)))
+        n_procs = max(1, min(4, int(body.processes)))
+        beam_sz = max(1, min(5, int(body.beam_size)))
 
         def _spawn_and_watch() -> None:
             try:
-                _asr_log(f"启动 GPU ASR 任务：mode={body.mode}，进程数={n_procs}，batch_size={body.batch_size}")
+                _asr_log(
+                    f"启动 GPU ASR 任务：mode={body.mode}，进程数={n_procs}，"
+                    f"batch_size={body.batch_size}，beam_size={beam_sz}"
+                )
                 local_procs: List[subprocess.Popen] = []
                 for idx in range(n_procs):
                     cmd = [
@@ -549,7 +554,7 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
                         "--batch-size",
                         str(body.batch_size),
                         "--beam-size",
-                        "2",
+                        str(beam_sz),
                         "--chunk-length",
                         "10",
                         "--workers",
@@ -612,10 +617,17 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
         with asr_lock:
             for p in asr_procs:
                 if p.poll() is None:
-                    p.terminate()
+                    if sys.platform == "win32":
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                            capture_output=True,
+                            check=False,
+                        )
+                    else:
+                        p.terminate()
                     stopped += 1
         if stopped:
-            _asr_log(f"已发送停止信号给 {stopped} 个 GPU ASR 进程（已写入数据库的分P全部保留）。")
+            _asr_log(f"已发送停止信号给 {stopped} 个 GPU ASR 进程树（已写入数据库的分P全部保留）。")
         return {"stopped": stopped}
 
     return router

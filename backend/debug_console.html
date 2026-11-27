@@ -430,11 +430,18 @@
         <label>并行 GPU 进程数：
           <select id="asrProcs">
             <option value="1">1 进程（省显存）</option>
-            <option value="2" selected>2 进程（推荐双并发）</option>
+            <option value="2">2 进程（稳妥均衡）</option>
+            <option value="3" selected>3 进程（吃满 12G 显存提速）</option>
           </select>
         </label>
         <label>Batch Size：
-          <input id="asrBatch" type="number" value="8" min="1" max="32" style="width:72px;" />
+          <input id="asrBatch" type="number" value="12" min="1" max="32" style="width:68px;" />
+        </label>
+        <label>Beam Size：
+          <select id="asrBeam">
+            <option value="1" selected>1（极速高精度，推荐）</option>
+            <option value="2">2（标准精度，较慢）</option>
+          </select>
         </label>
         <button class="btn sec" id="btnAsrNew" onclick="startAsrJob('new_only')">补录无字幕新分P</button>
         <button class="btn" id="btnAsrRetrans" onclick="startAsrJob('retranscribe_legacy')">启动旧ASR高精度重录（断点续跑）</button>
@@ -1075,8 +1082,9 @@ async function pollAsrStatus() {
 async function startAsrJob(mode) {
   const body = {
     mode,
-    processes: parseInt(document.getElementById('asrProcs').value || '2', 10),
-    batch_size: parseInt(document.getElementById('asrBatch').value || '8', 10),
+    processes: parseInt(document.getElementById('asrProcs').value || '3', 10),
+    batch_size: parseInt(document.getElementById('asrBatch').value || '12', 10),
+    beam_size: parseInt(document.getElementById('asrBeam').value || '1', 10),
     limit: 0
   };
   const r = await fetch('/api/v1/admin/asr/start', {
