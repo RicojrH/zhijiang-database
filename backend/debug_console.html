@@ -430,8 +430,8 @@
         <label>并行 GPU 进程数：
           <select id="asrProcs">
             <option value="1">1 进程（省显存）</option>
-            <option value="2">2 进程（稳妥均衡）</option>
-            <option value="3" selected>3 进程（吃满 12G 显存提速）</option>
+            <option value="2" selected>2 进程（12G 显存最佳，防 OOM）</option>
+            <option value="3">3 进程（仅 16G+ 显存适用）</option>
           </select>
         </label>
         <label>Batch Size：
@@ -1082,7 +1082,7 @@ async function pollAsrStatus() {
 async function startAsrJob(mode) {
   const body = {
     mode,
-    processes: parseInt(document.getElementById('asrProcs').value || '3', 10),
+    processes: parseInt(document.getElementById('asrProcs').value || '2', 10),
     batch_size: parseInt(document.getElementById('asrBatch').value || '12', 10),
     beam_size: parseInt(document.getElementById('asrBeam').value || '1', 10),
     limit: 0

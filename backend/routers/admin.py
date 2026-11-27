@@ -114,7 +114,7 @@ class AnnouncementsSaveRequest(BaseModel):
 
 class AsrStartRequest(BaseModel):
     mode: str = Field(default="new_only", pattern="^(new_only|retranscribe_legacy)$")
-    processes: int = Field(default=3, ge=1, le=4)
+    processes: int = Field(default=2, ge=1, le=4)
     batch_size: int = Field(default=12, ge=1, le=32)
     beam_size: int = Field(default=1, ge=1, le=5)
     limit: int = Field(default=0, ge=0, le=5000)
