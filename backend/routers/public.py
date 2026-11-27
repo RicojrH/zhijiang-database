@@ -7,10 +7,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 
 from zhijiang_corpus.config import AppConfig, PROJECT_ROOT, VALID_SCENE_TYPES
 from zhijiang_corpus.db import CorpusDB
+from zhijiang_corpus.metrics import SiteMetricsDB
 from zhijiang_corpus.search import SearchQuery, SearchService
 
 
@@ -53,9 +54,22 @@ def _load_announcements() -> List[Dict[str, Any]]:
     return pinned + normal
 
 
+def _extract_client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = request.headers.get("x-real-ip", "").strip()
+    if xri:
+        return xri
+    if request.client and request.client.host:
+        return str(request.client.host)
+    return "unknown"
+
+
 def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
     router = APIRouter(prefix="/api/v1", tags=["Public Read-Only API"])
     search_svc = SearchService(db)
+    metrics_db = SiteMetricsDB(db.db_path.parent / "site_metrics.db")
 
     @router.get("/health", summary="服务健康检查")
     def health() -> Dict[str, Any]:
@@ -91,9 +105,23 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
         return {"items": _load_announcements()}
 
     @router.get("/stats", summary="语料库公开统计信息（实时读取数据库，禁止缓存）")
-    def stats(response: Response) -> Dict[str, Any]:
+    def stats(
+        request: Request,
+        response: Response,
+        track: bool = Query(default=False, description="为 true 时记录一次页面访问（UV/PV）"),
+    ) -> Dict[str, Any]:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         raw = db.get_stats()
+        try:
+            if track:
+                visitors = metrics_db.record_visit(
+                    _extract_client_ip(request),
+                    request.headers.get("user-agent", ""),
+                )
+            else:
+                visitors = metrics_db.get_summary()
+        except Exception:
+            visitors = {"total_uv": 0, "total_pv": 0, "today_uv": 0, "today_pv": 0}
         # 公网统计不暴露服务器本地磁盘绝对路径
         return {
             "db_size_mb": raw["db_size_mb"],
@@ -106,6 +134,7 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
             "latest_updated_at": raw.get("latest_updated_at"),
             "latest_video": raw.get("latest_video"),
             "announcements": _load_announcements(),
+            "visitors": visitors,
             "by_up": raw["by_up"],
             "by_scene": raw["by_scene"],
         }

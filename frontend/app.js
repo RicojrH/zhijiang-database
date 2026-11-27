@@ -4,7 +4,7 @@
   const CFG = window.ZHIJIANG_CONFIG || {};
   const API_BASE = (CFG.API_BASE || "").replace(/\/+$/, "");
 
-  const MEMBER_THEMES = {
+  const MEMBER_THEMES_LIGHT = {
     "嘉然": { color: "#E799B0", bg: "#FDF3F6", ink: "#9C3A5A", fan: "嘉心糖", official: "嘉然今天吃什么" },
     "贝拉": { color: "#DB7D74", bg: "#FDF3F2", ink: "#A13A31", fan: "贝极星", official: "贝拉kira" },
     "乃琳": { color: "#576690", bg: "#F1F3F8", ink: "#364369", fan: "奶淇琳", official: "乃琳Queen" },
@@ -12,6 +12,25 @@
     "心宜": { color: "#C93773", bg: "#FCEFF4", ink: "#9D2256", fan: "心球仪", official: "心宜不是心仪" },
     "思诺": { color: "#7252C0", bg: "#F4F1FB", ink: "#513399", fan: "小海诺", official: "思诺snow" }
   };
+
+  const MEMBER_THEMES_DARK = {
+    "嘉然": { color: "#E799B0", bg: "rgba(231, 153, 176, 0.15)", ink: "#F4B8C9", fan: "嘉心糖", official: "嘉然今天吃什么" },
+    "贝拉": { color: "#DB7D74", bg: "rgba(219, 125, 116, 0.15)", ink: "#F0A39B", fan: "贝极星", official: "贝拉kira" },
+    "乃琳": { color: "#8798C8", bg: "rgba(135, 152, 200, 0.16)", ink: "#B3C1E8", fan: "奶淇琳", official: "乃琳Queen" },
+    "向晚": { color: "#9AC8E2", bg: "rgba(154, 200, 226, 0.15)", ink: "#B5DCF2", fan: "顶碗人", official: "向晚大魔王" },
+    "心宜": { color: "#E05C94", bg: "rgba(224, 92, 148, 0.16)", ink: "#F594BC", fan: "心球仪", official: "心宜不是心仪" },
+    "思诺": { color: "#9A7EE0", bg: "rgba(154, 126, 224, 0.16)", ink: "#C3B0F2", fan: "小海诺", official: "思诺snow" }
+  };
+
+  const MEMBER_THEMES = MEMBER_THEMES_LIGHT;
+
+  const THEME_ICONS = {
+    auto: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>`,
+    light: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>`,
+    dark: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`
+  };
+  const THEME_LABELS = { auto: "跟随系统", light: "浅色", dark: "深色" };
+  const darkMediaQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
 
   const SCENE_LABELS = {
     solo: "单播",
@@ -51,14 +70,69 @@
     return Number(n || 0).toLocaleString("zh-CN");
   }
 
+  function isDarkMode() {
+    return document.documentElement.dataset.theme === "dark";
+  }
+
+  function getSavedThemeMode() {
+    try {
+      const m = localStorage.getItem("zj_theme") || "auto";
+      return (m === "light" || m === "dark" || m === "auto") ? m : "auto";
+    } catch (e) {
+      return "auto";
+    }
+  }
+
+  function updateThemeButton(mode) {
+    const iconEl = $("themeIcon");
+    const labelEl = $("themeLabel");
+    const btn = $("themeToggleBtn");
+    if (iconEl) iconEl.innerHTML = THEME_ICONS[mode] || THEME_ICONS.auto;
+    if (labelEl) labelEl.textContent = THEME_LABELS[mode] || "跟随系统";
+    if (btn) {
+      const curText = isDarkMode() ? "当前深色" : "当前浅色";
+      btn.title = `主题模式：${THEME_LABELS[mode] || "跟随系统"}（${curText}），点击切换`;
+    }
+  }
+
+  function syncVisibleHitCardThemes() {
+    document.querySelectorAll(".hit-card[data-up]").forEach((card) => {
+      const t = getTheme(card.dataset.up || "");
+      card.style.setProperty("--m-color", t.color);
+      card.style.setProperty("--m-bg", t.bg);
+      card.style.setProperty("--m-ink", t.ink);
+    });
+  }
+
+  function applyThemeMode(mode, persist) {
+    const safeMode = (mode === "light" || mode === "dark" || mode === "auto") ? mode : "auto";
+    if (persist) {
+      try { localStorage.setItem("zj_theme", safeMode); } catch (e) {}
+    }
+    const dark = safeMode === "dark" || (safeMode === "auto" && Boolean(darkMediaQuery && darkMediaQuery.matches));
+    document.documentElement.dataset.themeMode = safeMode;
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    updateThemeButton(safeMode);
+    applyThemeAccent();
+    renderMemberChips();
+    renderLandingStatsAndCards();
+    syncVisibleHitCardThemes();
+  }
+
+  function cycleThemeMode() {
+    const order = ["auto", "light", "dark"];
+    const cur = getSavedThemeMode();
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    applyThemeMode(next, true);
+  }
+
   function getTheme(upName) {
-    return MEMBER_THEMES[upName] || {
-      color: "#576690",
-      bg: "#F1F3F8",
-      ink: "#364369",
-      fan: "枝江",
-      official: upName || ""
-    };
+    const dark = isDarkMode();
+    const map = dark ? MEMBER_THEMES_DARK : MEMBER_THEMES_LIGHT;
+    return map[upName] || (dark
+      ? { color: "#8798C8", bg: "rgba(135, 152, 200, 0.16)", ink: "#B3C1E8", fan: "枝江", official: upName || "" }
+      : { color: "#576690", bg: "#F1F3F8", ink: "#364369", fan: "枝江", official: upName || "" }
+    );
   }
 
   function applyThemeAccent() {
@@ -133,10 +207,13 @@
       : Object.keys(MEMBER_THEMES).map((up_name) => ({ up_name, ...MEMBER_THEMES[up_name] }));
 
     const allActive = state.selectedUps.size === 0 ? "active" : "";
+    const allChipStyle = isDarkMode()
+      ? "--chip-color:#8798C8;--chip-bg:rgba(135,152,200,0.16);--chip-ink:#EEF1F8;"
+      : "--chip-color:#576690;--chip-bg:#F1F3F8;--chip-ink:#1B2232;";
     const allBtn = `
       <span class="strip-label">成员（可多选）</span>
       <button type="button" class="member-chip ${allActive}"
-        data-up="" style="--chip-color:#576690;--chip-bg:#F1F3F8;--chip-ink:#1B2232;">
+        data-up="" style="${allChipStyle}">
         全部成员
       </button>
     `;
@@ -266,6 +343,19 @@
     }
   }
 
+  function renderVisitorMetrics(v) {
+    const el = $("footerVisitorStats");
+    if (!el) return;
+    if (!v || (Number(v.total_uv || 0) <= 0 && Number(v.total_pv || 0) <= 0)) {
+      el.classList.add("hidden");
+      return;
+    }
+    el.classList.remove("hidden");
+    el.innerHTML =
+      `<span class="footer-metrics-dot" aria-hidden="true"></span>` +
+      `<span>累计访客 <strong>${formatNumber(v.total_uv)}</strong> 人（今日 <strong>${formatNumber(v.today_uv)}</strong>）· 累计访问 <strong>${formatNumber(v.total_pv)}</strong> 次</span>`;
+  }
+
   function renderLandingStatsAndCards() {
     const st = state.stats;
     if (st) {
@@ -303,6 +393,7 @@
       }
 
       renderAnnouncements(st.announcements);
+      renderVisitorMetrics(st.visitors);
     }
 
     const byUpMap = {};
@@ -515,7 +606,7 @@
         const t = getTheme(it.up_name);
         const sceneName = SCENE_LABELS[it.scene_type] || it.scene_type;
         return `
-          <article class="hit-card" style="--m-color:${t.color};--m-bg:${t.bg};--m-ink:${t.ink};">
+          <article class="hit-card" data-up="${esc(it.up_name)}" style="--m-color:${t.color};--m-bg:${t.bg};--m-ink:${t.ink};">
             <div class="hit-meta">
               <span class="badge badge-member">
                 <span class="color-dot" style="background:${t.color};"></span>
@@ -679,11 +770,21 @@
   }
 
   async function init() {
-    renderMemberChips();
+    applyThemeMode(getSavedThemeMode(), false);
     renderSceneChips();
-    renderLandingStatsAndCards();
     renderAuthorAndGithub();
-    applyThemeAccent();
+
+    const themeBtn = $("themeToggleBtn");
+    if (themeBtn) {
+      themeBtn.addEventListener("click", cycleThemeMode);
+    }
+    if (darkMediaQuery && darkMediaQuery.addEventListener) {
+      darkMediaQuery.addEventListener("change", () => {
+        if (getSavedThemeMode() === "auto") {
+          applyThemeMode("auto", false);
+        }
+      });
+    }
 
     $("sceneStrip").querySelectorAll(".scene-chip").forEach((btn) => {
       btn.addEventListener("click", () => toggleScene(btn.dataset.scene || ""));
@@ -742,7 +843,7 @@
     try {
       const [mRes, sRes] = await Promise.all([
         fetch(`${API_BASE}/api/v1/members`, { cache: "no-store" }),
-        fetch(`${API_BASE}/api/v1/stats`, { cache: "no-store" })
+        fetch(`${API_BASE}/api/v1/stats?track=1`, { cache: "no-store" })
       ]);
       if (mRes.ok) {
         const mData = await mRes.json();

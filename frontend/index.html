@@ -3,9 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
   <meta name="description" content="枝江直播回放 AI 字幕语料库检索：覆盖嘉然、贝拉、乃琳、向晚、心宜、思诺近 6 年直播回放，面向二创剪辑的毫秒级台词与热梗检索工具。" />
   <title>枝江字幕检索 · 直播回放台词与热梗语料库</title>
-  <link rel="stylesheet" href="./styles.css?v=20261126" />
+  <script>
+    (function () {
+      try {
+        var mode = localStorage.getItem("zj_theme") || "auto";
+        if (mode !== "light" && mode !== "dark" && mode !== "auto") mode = "auto";
+        var isDark = mode === "dark" || (mode === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.themeMode = mode;
+        document.documentElement.dataset.theme = isDark ? "dark" : "light";
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="./styles.css?v=20261127" />
 </head>
 <body>
   <div class="spectrum-bar" aria-hidden="true"></div>
@@ -28,6 +40,10 @@
       </div>
 
       <nav class="header-nav" aria-label="站点导航">
+        <button type="button" class="nav-btn theme-btn" id="themeToggleBtn" title="切换显示主题（跟随系统 / 浅色 / 深色）">
+          <span class="theme-icon" id="themeIcon" aria-hidden="true"></span>
+          <span id="themeLabel">跟随系统</span>
+        </button>
         <button type="button" class="nav-btn" id="aboutBtn">关于与作者</button>
       </nav>
     </div>
@@ -184,7 +200,10 @@
 
   <footer class="site-footer">
     <div class="footer-inner">
-      <div>枝江直播回放字幕语料库 · 面向二创剪辑的公益检索工具</div>
+      <div class="footer-left">
+        <div>枝江直播回放字幕语料库 · 面向二创剪辑的公益检索工具</div>
+        <div class="footer-metrics hidden" id="footerVisitorStats" aria-label="站点访问统计"></div>
+      </div>
       <div class="footer-links">
         <span>作者 B 站：<a id="footerAuthorLink" href="https://space.bilibili.com/396896138" target="_blank" rel="noopener noreferrer">@没品人类之一</a></span>
         <a id="footerGithubLink" class="hidden" href="#" target="_blank" rel="noopener noreferrer">GitHub 开源项目</a>
@@ -222,7 +241,7 @@
     </div>
   </div>
 
-  <script src="./config.js?v=20261126"></script>
-  <script src="./app.js?v=20261126"></script>
+  <script src="./config.js?v=20261127"></script>
+  <script src="./app.js?v=20261127"></script>
 </body>
 </html>

@@ -312,6 +312,26 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     assert st["latest_video"]["bvid"].startswith("BV1")
     assert st["latest_video"]["video_url"].startswith("https://www.bilibili.com/video/")
     assert isinstance(st["announcements"], list)
+    assert "visitors" in st and st["visitors"]["total_uv"] == 0
+    # 校验访问统计：同一浏览器二次访问 UV 去重、PV 累加，爬虫不计入
+    st_v1 = pub_client.get(
+        "/api/v1/stats?track=1",
+        headers={"User-Agent": "Mozilla/5.0 Chrome/120.0", "X-Forwarded-For": "203.0.113.10"},
+    ).json()
+    assert st_v1["visitors"]["total_uv"] == 1
+    assert st_v1["visitors"]["total_pv"] == 1
+    st_v2 = pub_client.get(
+        "/api/v1/stats?track=1",
+        headers={"User-Agent": "Mozilla/5.0 Chrome/120.0", "X-Forwarded-For": "203.0.113.10"},
+    ).json()
+    assert st_v2["visitors"]["total_uv"] == 1
+    assert st_v2["visitors"]["total_pv"] == 2
+    st_bot = pub_client.get(
+        "/api/v1/stats?track=1",
+        headers={"User-Agent": "Googlebot/2.1", "X-Forwarded-For": "203.0.113.99"},
+    ).json()
+    assert st_bot["visitors"]["total_uv"] == 1
+    assert st_bot["visitors"]["total_pv"] == 2
     ann_res = pub_client.get("/api/v1/announcements")
     assert ann_res.status_code == 200
     assert any("ASR" in item["content"] for item in ann_res.json()["items"])
