@@ -42,9 +42,11 @@ BANK_FILE_NAME = "zhijiang_6members_v3.npz"
 
 # GPU 批量分桶步长：16 帧 = 0.16 秒（2560 采样点），在不引入任何零填充失真的前提下将全片窗口聚合成少数定长 Batch
 _BUCKET_STEP_SAMPLES = 2560
-_MIN_SEG_SAMPLES = 7200       # 0.45s
-_MIN_BUCKET_SAMPLES = 7680    # 0.48s = 48 frames
-_MAX_BUCKET_SAMPLES = 102400  # 6.40s = 640 frames
+_MIN_SEG_SAMPLES = 7200      # 0.45s
+_MIN_BUCKET_SAMPLES = 7680   # 0.48s = 48 frames
+_MAX_BUCKET_SAMPLES = 64000  # 4.00s = 400 frames（4秒语音已完全满足声纹精度，杜绝超长句显存暴涨）
+# 单次 GPU 前向的总帧数预算（6144 帧 ≈ 64×0.96s），长句自动缩减 Batch，单进程显存恒定 < 1GB
+_MAX_GPU_FRAMES_PER_BATCH = 6144
 
 
 def is_voiceprint_cuda_available() -> bool:
@@ -231,6 +233,46 @@ def load_wav_float32(wav_path: Path) -> Tuple[np.ndarray, int]:
     return samples, sr
 
 
+class WavSliceReader:
+    """零常驻内存的流式 WAV 按区间切片读取器（避免 2~4 小时录播一次分配 500MB+ float32 数组导致 RAM OOM）."""
+
+    def __init__(self, wav_path: Path):
+        self.wav_path = wav_path
+        self._wf: Optional[wave.Wave_read] = None
+        self.sr: int = 16000
+        self.nch: int = 1
+        self.total_samples: int = 0
+
+    def __enter__(self) -> "WavSliceReader":
+        wf = wave.open(str(self.wav_path), "rb")
+        self._wf = wf
+        self.sr = wf.getframerate()
+        self.nch = wf.getnchannels()
+        self.total_samples = wf.getnframes()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._wf is not None:
+            try:
+                self._wf.close()
+            finally:
+                self._wf = None
+
+    def read_float32(self, i0: int, i1: int) -> np.ndarray:
+        assert self._wf is not None
+        s = max(0, min(self.total_samples, int(i0)))
+        e = max(s, min(self.total_samples, int(i1)))
+        n = e - s
+        if n <= 0:
+            return np.empty(0, dtype=np.float32)
+        self._wf.setpos(s)
+        raw = self._wf.readframes(n)
+        arr = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        if self.nch > 1:
+            arr = arr.reshape(-1, self.nch).mean(axis=1)
+        return arr
+
+
 class VoiceprintEngine:
     """正式版双模型声纹识别器（支持 CUDA GPU 批量分桶推理 + CPU 自动回退）."""
 
@@ -314,6 +356,7 @@ class VoiceprintEngine:
             cuda_opts = {
                 "cudnn_conv_algo_search": "HEURISTIC",
                 "arena_extend_strategy": "kSameAsRequested",
+                "gpu_mem_limit": str(3 * 1024 * 1024 * 1024),
             }
             providers = [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
             s_camp = ort.InferenceSession(str(camp_path), sess_options=so, providers=providers)
@@ -422,12 +465,65 @@ class VoiceprintEngine:
             return self.extract_pairs_batch([seg], sr)[0]
         return self._extract_pair_cpu(seg, sr)
 
+    def _run_gpu_chunk(
+        self,
+        chunk: List[Tuple[int, np.ndarray, np.ndarray]],
+        out: List[Optional[Tuple[np.ndarray, np.ndarray]]],
+    ) -> None:
+        """执行单个等长 GPU Batch 前向，若极端情况触发显存不足自动折半重试."""
+        assert self._ort_camp is not None and self._ort_wesp is not None
+        if not chunk:
+            return
+        try:
+            batch_c = np.stack([it[1] for it in chunk], axis=0)
+            batch_w = np.stack([it[2] for it in chunk], axis=0)
+            raw_c = np.asarray(
+                self._ort_camp.run(None, {self._ort_camp_in: batch_c})[0],
+                dtype=np.float32,
+            )
+            raw_w = np.asarray(
+                self._ort_wesp.run(None, {self._ort_wesp_in: batch_w})[0],
+                dtype=np.float32,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if len(chunk) > 1 and ("BFCArena" in msg or "AllocateRaw" in msg or "out of memory" in msg.lower()):
+                mid = len(chunk) // 2
+                self._run_gpu_chunk(chunk[:mid], out)
+                self._run_gpu_chunk(chunk[mid:], out)
+                return
+            raise
+
+        norms_c = np.linalg.norm(raw_c, axis=-1, keepdims=True)
+        norms_w = np.linalg.norm(raw_w, axis=-1, keepdims=True)
+        vcs = raw_c / np.maximum(norms_c, 1e-8)
+        vws = raw_w / np.maximum(norms_w, 1e-8)
+        vjs = _l2_norm(
+            np.concatenate([self.w_camp * vcs, self.w_wesp * vws], axis=-1).astype(np.float32)
+        )
+        for local_i, (orig_idx, _, _) in enumerate(chunk):
+            if float(norms_c[local_i, 0]) <= 1e-8 or float(norms_w[local_i, 0]) <= 1e-8:
+                continue
+            out[orig_idx] = (vcs[local_i], vjs[local_i])
+
+    def _flush_gpu_buckets(
+        self,
+        buckets: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]],
+        out: List[Optional[Tuple[np.ndarray, np.ndarray]]],
+    ) -> None:
+        """按固定总帧预算动态限制每批 Batch 大小，杜绝长句触发 Conv 显存暴涨."""
+        for t_frames, items in buckets.items():
+            eff_bs = max(1, min(self.batch_size, _MAX_GPU_FRAMES_PER_BATCH // max(1, int(t_frames))))
+            for off in range(0, len(items), eff_bs):
+                self._run_gpu_chunk(items[off : off + eff_bs], out)
+        buckets.clear()
+
     def extract_pairs_batch(
         self,
         segments: Sequence[np.ndarray],
         sr: int,
     ) -> List[Optional[Tuple[np.ndarray, np.ndarray]]]:
-        """按帧长分桶执行无填充 GPU 批量声纹提取（CPU 模式下自动逐条回退）."""
+        """按帧长分桶执行无填充 GPU 批量声纹提取（自动流式分波，内存恒定低占用）."""
         out: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * len(segments)
         if not segments:
             return out
@@ -437,9 +533,9 @@ class VoiceprintEngine:
                 out[idx] = self._extract_pair_cpu(seg, sr)
             return out
 
-        assert self._ort_camp is not None and self._ort_wesp is not None
         min_len = int(0.45 * sr)
         buckets: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]] = {}
+        buffered = 0
         for idx, seg in enumerate(segments):
             if len(seg) < min_len:
                 continue
@@ -451,32 +547,57 @@ class VoiceprintEngine:
             fc, fw = pair_fb
             t_frames = int(fc.shape[0])
             buckets.setdefault(t_frames, []).append((idx, fc, fw))
+            buffered += 1
+            if buffered >= 1536:
+                self._flush_gpu_buckets(buckets, out)
+                buffered = 0
 
-        bs = self.batch_size
-        for items in buckets.values():
-            for off in range(0, len(items), bs):
-                chunk = items[off : off + bs]
-                batch_c = np.stack([it[1] for it in chunk], axis=0)
-                batch_w = np.stack([it[2] for it in chunk], axis=0)
-                raw_c = np.asarray(
-                    self._ort_camp.run(None, {self._ort_camp_in: batch_c})[0],
-                    dtype=np.float32,
-                )
-                raw_w = np.asarray(
-                    self._ort_wesp.run(None, {self._ort_wesp_in: batch_w})[0],
-                    dtype=np.float32,
-                )
-                norms_c = np.linalg.norm(raw_c, axis=-1, keepdims=True)
-                norms_w = np.linalg.norm(raw_w, axis=-1, keepdims=True)
-                vcs = raw_c / np.maximum(norms_c, 1e-8)
-                vws = raw_w / np.maximum(norms_w, 1e-8)
-                vjs = _l2_norm(
-                    np.concatenate([self.w_camp * vcs, self.w_wesp * vws], axis=-1).astype(np.float32)
-                )
-                for local_i, (orig_idx, _, _) in enumerate(chunk):
-                    if float(norms_c[local_i, 0]) <= 1e-8 or float(norms_w[local_i, 0]) <= 1e-8:
-                        continue
-                    out[orig_idx] = (vcs[local_i], vjs[local_i])
+        if buffered > 0:
+            self._flush_gpu_buckets(buckets, out)
+        return out
+
+    def extract_spans_batch(
+        self,
+        fetch_seg: Callable[[int, int], np.ndarray],
+        spans: Sequence[Tuple[int, int]],
+        sr: int,
+    ) -> List[Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """流式按 (i0, i1) 区间读取切片并分波送入 GPU，不常驻整片音频或数千帧特征."""
+        out: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * len(spans)
+        if not spans:
+            return out
+
+        min_len = int(0.45 * sr)
+        if self.device != "cuda":
+            for idx, (i0, i1) in enumerate(spans):
+                if i1 - i0 < min_len:
+                    continue
+                out[idx] = self._extract_pair_cpu(fetch_seg(i0, i1), sr)
+            return out
+
+        buckets: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]] = {}
+        buffered = 0
+        for idx, (i0, i1) in enumerate(spans):
+            if i1 - i0 < min_len:
+                continue
+            seg = fetch_seg(i0, i1)
+            if len(seg) < min_len:
+                continue
+            if float(np.sqrt(np.mean(seg * seg) + 1e-12)) < 0.004:
+                continue
+            pair_fb = self._compute_fbank_pair(seg, sr)
+            if pair_fb is None:
+                continue
+            fc, fw = pair_fb
+            t_frames = int(fc.shape[0])
+            buckets.setdefault(t_frames, []).append((idx, fc, fw))
+            buffered += 1
+            if buffered >= 1536:
+                self._flush_gpu_buckets(buckets, out)
+                buffered = 0
+
+        if buffered > 0:
+            self._flush_gpu_buckets(buckets, out)
         return out
 
     def score_window(
@@ -529,9 +650,10 @@ class VoiceprintEngine:
 
         return t1, [t1], False, cos_map[t1], pmap[t1]
 
-    def identify_part(
+    def _identify_part_core(
         self,
-        audio: np.ndarray,
+        fetch_seg: Callable[[int, int], np.ndarray],
+        total_samples: int,
         sr: int,
         subtitles: Sequence[Tuple[int, float, float, str]],
         *,
@@ -540,37 +662,32 @@ class VoiceprintEngine:
         scene_type: str,
         title: str = "",
     ) -> List[Tuple[int, str, float]]:
-        """对单个分 P 的全部字幕行执行全片分桶批量声纹标注与局部上下文平滑."""
+        """流式按区间执行全片分桶批量声纹标注与局部上下文平滑（零整片音频常驻内存）."""
         cands = active_candidates_for_video(
             up_name=up_name,
             pub_date=pub_date,
             scene_type=scene_type,
             title=title,
         )
-        total_samples = len(audio)
         total_audio_sec = total_samples / float(sr) if sr > 0 else 0.0
         use_snap = self.device == "cuda"
 
-        def _slice(ws: float, we: float) -> np.ndarray:
+        def _bounds(ws: float, we: float) -> Tuple[int, int]:
             we_c = min(we, total_audio_sec)
             if use_snap:
-                i0, i1 = _snap_audio_bounds(ws, we_c, total_samples, sr)
-            else:
-                i0 = max(0, int(ws * sr))
-                i1 = min(total_samples, int(we_c * sr))
-            return audio[i0:i1]
+                return _snap_audio_bounds(ws, we_c, total_samples, sr)
+            return max(0, int(ws * sr)), min(total_samples, int(we_c * sr))
 
-        # Phase 1: 收集全片所有单窗 / 滑窗切片，一次分桶批量送入 GPU 提取声纹
-        phase1_segs: List[np.ndarray] = []
-        # mode='single': (line_idx, seg_idx) | mode='multi': (line_idx, [seg_indices])
+        # Phase 1: 仅收集 (i0, i1) 整数区间，流式读片分波送 GPU，不占用整片内存
+        phase1_spans: List[Tuple[int, int]] = []
         line_plans: List[Tuple[str, Any]] = []
 
         for sid, s0, e0, _ in subtitles:
             dur = max(0.0, e0 - s0)
             if dur < 1.35 or len(cands) <= 1:
                 pad = max(0.08, (0.85 - dur) * 0.5) if dur < 0.85 else 0.08
-                seg_idx = len(phase1_segs)
-                phase1_segs.append(_slice(max(0.0, s0 - pad), e0 + pad))
+                seg_idx = len(phase1_spans)
+                phase1_spans.append(_bounds(max(0.0, s0 - pad), e0 + pad))
                 line_plans.append(("single", seg_idx))
                 continue
 
@@ -590,17 +707,17 @@ class VoiceprintEngine:
 
             w_indices: List[int] = []
             for ws, we in wins:
-                w_indices.append(len(phase1_segs))
-                phase1_segs.append(_slice(ws, we))
+                w_indices.append(len(phase1_spans))
+                phase1_spans.append(_bounds(ws, we))
             line_plans.append(("multi", w_indices))
 
-        phase1_pairs = self.extract_pairs_batch(phase1_segs, sr)
+        phase1_pairs = self.extract_spans_batch(fetch_seg, phase1_spans, sr)
 
         raw_results: List[Tuple[int, float, float, str, float]] = [
             (sid, s0, e0, "", 0.0) for sid, s0, e0, _ in subtitles
         ]
         fallback_line_indices: List[int] = []
-        fallback_segs: List[np.ndarray] = []
+        fallback_spans: List[Tuple[int, int]] = []
 
         for line_idx, ((sid, s0, e0, _), (mode, ref)) in enumerate(zip(subtitles, line_plans)):
             if mode == "single":
@@ -643,7 +760,7 @@ class VoiceprintEngine:
             uniq = [s for s in ord_sp if votes[s] >= 1]
             if not uniq:
                 fallback_line_indices.append(line_idx)
-                fallback_segs.append(_slice(s0, e0))
+                fallback_spans.append(_bounds(s0, e0))
             elif len(uniq) == 1:
                 sp = uniq[0]
                 raw_results[line_idx] = (sid, s0, e0, sp, round(min(0.99, best_conf[sp]), 3))
@@ -653,9 +770,9 @@ class VoiceprintEngine:
                 conf = round(min(0.99, max(best_conf[s] for s in top2_ord)), 3)
                 raw_results[line_idx] = (sid, s0, e0, "+".join(top2_ord), conf)
 
-        # Phase 2: 仅对滑窗未达成高置信投票的少量长句，整句批量回退识别一次
-        if fallback_segs:
-            fb_pairs = self.extract_pairs_batch(fallback_segs, sr)
+        # Phase 2: 仅对滑窗未达成高置信投票的少量长句，整句流式批量回退识别一次
+        if fallback_spans:
+            fb_pairs = self.extract_spans_batch(fetch_seg, fallback_spans, sr)
             for line_idx, pair in zip(fallback_line_indices, fb_pairs):
                 if pair is None:
                     continue
@@ -690,6 +807,52 @@ class VoiceprintEngine:
                     conf = round(min(prev_c, next_c) * 0.9, 3)
             smoothed.append((sid, lbl, conf))
         return smoothed
+
+    def identify_part(
+        self,
+        audio: np.ndarray,
+        sr: int,
+        subtitles: Sequence[Tuple[int, float, float, str]],
+        *,
+        up_name: str,
+        pub_date: str,
+        scene_type: str,
+        title: str = "",
+    ) -> List[Tuple[int, str, float]]:
+        """对内存中已加载的音频数组执行声纹标注（兼容直接传数组调用）."""
+        return self._identify_part_core(
+            lambda i0, i1: audio[i0:i1],
+            len(audio),
+            sr,
+            subtitles,
+            up_name=up_name,
+            pub_date=pub_date,
+            scene_type=scene_type,
+            title=title,
+        )
+
+    def identify_part_from_wav(
+        self,
+        wav_path: Path,
+        subtitles: Sequence[Tuple[int, float, float, str]],
+        *,
+        up_name: str,
+        pub_date: str,
+        scene_type: str,
+        title: str = "",
+    ) -> List[Tuple[int, str, float]]:
+        """零常驻内存流式读取 WAV 并执行全片分桶批量声纹标注（彻底杜绝 2~4 小时录播 RAM OOM）."""
+        with WavSliceReader(wav_path) as reader:
+            return self._identify_part_core(
+                reader.read_float32,
+                reader.total_samples,
+                reader.sr,
+                subtitles,
+                up_name=up_name,
+                pub_date=pub_date,
+                scene_type=scene_type,
+                title=title,
+            )
 
 
 def _watch_along_sql_clause() -> str:
@@ -920,7 +1083,6 @@ def run_voiceprint_batch(
 
             t0 = time.perf_counter()
             try:
-                audio, sr = load_wav_float32(wav_path)
                 with db.session() as conn:
                     sub_rows = conn.execute(
                         """
@@ -932,9 +1094,8 @@ def run_voiceprint_batch(
                         (bvid, page),
                     ).fetchall()
                 subs = [(int(r["id"]), float(r["start_sec"]), float(r["end_sec"]), str(r["content"])) for r in sub_rows]
-                labeled = engine.identify_part(
-                    audio,
-                    sr,
+                labeled = engine.identify_part_from_wav(
+                    wav_path,
                     subs,
                     up_name=up_name,
                     pub_date=pub_date,
@@ -966,7 +1127,7 @@ def run_voiceprint_batch(
                 )
             except Exception as exc:
                 failed += 1
-                emit(f"{shard_tag}[{idx}/{len(targets)}] 推理失败 {bvid} P{page}: {exc}")
+                emit(f"{shard_tag}[{idx}/{len(targets)}] 推理失败 {bvid} P{page}: {type(exc).__name__}: {exc}")
             finally:
                 wav_path.unlink(missing_ok=True)
     finally:
