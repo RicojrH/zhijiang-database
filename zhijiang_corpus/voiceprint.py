@@ -991,7 +991,23 @@ def run_voiceprint_batch(
     tmp_root = Path(tempfile.gettempdir()) / "zhijiang_vp"
     tmp_root.mkdir(parents=True, exist_ok=True)
 
-    # 共享任务索引队列 + 多线程并发预取，避免 GPU 等待 B 站流下载与 FFmpeg 解码
+    # 启动前自动清理历史残留的孤儿临时音频（单分片清理 5 秒前旧文件；多分片清理 30 分钟前旧文件避免误伤同批兄弟进程）
+    stale_age = 5.0 if shard_total <= 1 else 1800.0
+    now_ts = time.time()
+    cleaned_old = 0
+    for old_f in list(tmp_root.glob("*")):
+        if not old_f.is_file() or old_f.suffix.lower() not in (".wav", ".m4a", ".tmp"):
+            continue
+        try:
+            if (now_ts - old_f.stat().st_mtime) >= stale_age:
+                old_f.unlink(missing_ok=True)
+                cleaned_old += 1
+        except OSError:
+            pass
+    if cleaned_old > 0:
+        emit(f"{shard_tag}已自动清理历史残留临时音频 {cleaned_old} 个。")
+
+    # 共享任务索引队列 + 多线程并发预取（严格限制缓冲上限 <=4，防止多进程预取堆积数十 GB WAV）
     src_q: "queue.Queue[Optional[Tuple[int, Dict[str, Any]]]]" = queue.Queue()
     for idx, item in enumerate(targets, 1):
         src_q.put((idx, item))
@@ -999,7 +1015,7 @@ def run_voiceprint_batch(
         src_q.put(None)
 
     task_q: "queue.Queue[Optional[Tuple[int, Dict[str, Any], Optional[Path], Optional[str]]]]" = queue.Queue(
-        maxsize=max(3, n_prefetch * 2)
+        maxsize=max(2, min(4, n_prefetch + 1))
     )
     stop_ev = threading.Event()
     alive_pf = [n_prefetch]
@@ -1050,12 +1066,26 @@ def run_voiceprint_batch(
                         wav.unlink(missing_ok=True)
                     finally:
                         m4a.unlink(missing_ok=True)
-                    task_q.put((idx, item, None if err_msg else wav, err_msg))
+                    payload = (idx, item, None if err_msg else wav, err_msg)
+                    pushed = False
+                    while not stop_ev.is_set():
+                        try:
+                            task_q.put(payload, timeout=0.5)
+                            pushed = True
+                            break
+                        except queue.Full:
+                            continue
+                    if not pushed:
+                        wav.unlink(missing_ok=True)
+                        break
         finally:
             with alive_lock:
                 alive_pf[0] -= 1
                 if alive_pf[0] <= 0:
-                    task_q.put(None)
+                    try:
+                        task_q.put(None, timeout=1.0)
+                    except queue.Full:
+                        pass
 
     pf_threads = [threading.Thread(target=_prefetch_worker, daemon=True) for _ in range(n_prefetch)]
     for t in pf_threads:
@@ -1135,8 +1165,29 @@ def run_voiceprint_batch(
                 wav_path.unlink(missing_ok=True)
     finally:
         stop_ev.set()
+        # 退出时立即清空队列中尚未消费的预取 WAV，杜绝中断遗留大文件
+        while True:
+            try:
+                rem = task_q.get_nowait()
+            except queue.Empty:
+                break
+            if rem and rem[2] is not None:
+                try:
+                    rem[2].unlink(missing_ok=True)
+                except OSError:
+                    pass
         for t in pf_threads:
             t.join(timeout=5)
+        while True:
+            try:
+                rem = task_q.get_nowait()
+            except queue.Empty:
+                break
+            if rem and rem[2] is not None:
+                try:
+                    rem[2].unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     return {
         "targets": len(targets),

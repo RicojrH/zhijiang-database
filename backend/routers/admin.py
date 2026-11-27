@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -626,6 +627,10 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
             except Exception as exc:
                 _asr_log(f"❌ GPU ASR 任务异常：{exc}")
             finally:
+                # 清理已结束/被强杀的 ASR 临时音频目录，防止残留占用磁盘
+                tmp_base = PROJECT_ROOT / "data" / "tmp_asr"
+                for d in tmp_base.glob("zj_asr_*"):
+                    shutil.rmtree(d, ignore_errors=True)
                 with asr_lock:
                     asr_procs.clear()
                     asr_state["running"] = False
@@ -769,6 +774,17 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
             except Exception as exc:
                 _vp_log(f"❌ 声纹任务异常：{exc}")
             finally:
+                # 清理已结束/被强杀的声纹预取临时音频，防止残留堆积数 GB WAV
+                vp_tmp = PROJECT_ROOT / "data" / "tmp_asr" / "zhijiang_vp"
+                if vp_tmp.exists():
+                    for f in list(vp_tmp.glob("*")):
+                        try:
+                            if f.is_dir():
+                                shutil.rmtree(f, ignore_errors=True)
+                            else:
+                                f.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 with vp_lock:
                     vp_procs.clear()
                     vp_state["running"] = False
