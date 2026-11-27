@@ -663,3 +663,41 @@ def sync_database_to_cloud(
         "applied": apply_info,
         "live_stats": after_stats,
     }
+
+
+def backfill_cloud_metrics(
+    conf: Dict[str, Any],
+    password: Optional[str],
+    log_cb: LogCallback,
+) -> Dict[str, Any]:
+    """从云端 Nginx 历史访问日志（/var/log/nginx/access.log*）幂等补回上线以来的真实访客数."""
+    cloud_host = conf["cloud_host"]
+    app_dir = conf["cloud_app_dir"]
+    pub_url = conf["public_url"]
+
+    log_cb(f"正在连接云端 {cloud_host} 拉取最新代码并解析 /var/log/nginx/access.log* ...")
+    client = _open_ssh_client(cloud_host, password=password)
+    try:
+        code, out, err = _exec_remote(
+            client,
+            f"set -e; cd {app_dir}; git checkout -- config/announcements.json 2>/dev/null || true; "
+            "git pull --ff-only -q origin main; .venv/bin/python run.py backfill-metrics --log-dir /var/log/nginx",
+            timeout=120,
+        )
+        if code != 0:
+            raise RuntimeError(f"云端回灌历史访问统计失败: {err or out}")
+        info = json.loads(out.strip())
+        v = info.get("visitors") or {}
+        log_cb(
+            f"✅ 扫描 {len(info.get('files_scanned') or [])} 个 Nginx 日志文件（{info.get('lines_scanned', 0):,} 行），"
+            f"命中真实首页访问 {info.get('hits_matched', 0):,} 次。"
+        )
+        log_cb(
+            f"✅ 历史访问统计已补齐：累计访客 {v.get('total_uv', 0):,} 人（今日 {v.get('today_uv', 0):,}），"
+            f"累计访问 {v.get('total_pv', 0):,} 次！"
+        )
+    finally:
+        client.close()
+
+    live = _fetch_public_stats(pub_url)
+    return {"mode": "backfill_metrics", "backfill": info, "live_stats": live}

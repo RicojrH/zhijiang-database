@@ -332,6 +332,29 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     ).json()
     assert st_bot["visitors"]["total_uv"] == 1
     assert st_bot["visitors"]["total_pv"] == 2
+
+    # 校验从 Nginx 历史日志幂等补回访问人数
+    from zhijiang_corpus.metrics import SiteMetricsDB
+
+    ng_dir = tmp_path / "nginx_logs"
+    ng_dir.mkdir()
+    (ng_dir / "access.log").write_text(
+        '198.51.100.1 - - [26/Nov/2026:12:00:00 +0000] "GET / HTTP/2.0" 200 4096 "-" "Mozilla/5.0 Chrome/120"\n'
+        '198.51.100.1 - - [26/Nov/2026:12:05:00 +0000] "GET / HTTP/2.0" 200 4096 "-" "Mozilla/5.0 Chrome/120"\n'
+        '198.51.100.2 - - [26/Nov/2026:13:00:00 +0000] "GET / HTTP/2.0" 200 4096 "-" "Mozilla/5.0 Safari/605"\n'
+        '198.51.100.3 - - [26/Nov/2026:13:10:00 +0000] "GET /api/v1/stats HTTP/2.0" 200 500 "-" "Mozilla/5.0"\n'
+        '198.51.100.4 - - [26/Nov/2026:13:20:00 +0000] "GET / HTTP/2.0" 200 4096 "-" "Googlebot/2.1"\n',
+        encoding="utf-8",
+    )
+    mdb = SiteMetricsDB(tmp_path / "ng_metrics.db")
+    bf1 = mdb.import_nginx_access_logs(log_dir=ng_dir)
+    assert bf1["hits_matched"] == 3
+    assert bf1["visitors"]["total_uv"] == 2
+    assert bf1["visitors"]["total_pv"] == 3
+    # 重复执行一次必须幂等，不翻倍
+    bf2 = mdb.import_nginx_access_logs(log_dir=ng_dir)
+    assert bf2["visitors"]["total_uv"] == 2
+    assert bf2["visitors"]["total_pv"] == 3
     ann_res = pub_client.get("/api/v1/announcements")
     assert ann_res.status_code == 200
     assert any("ASR" in item["content"] for item in ann_res.json()["items"])

@@ -385,6 +385,7 @@
         <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;">
           <button class="btn" onclick="runCloudJob('scene_tags_only')" title="仅更新场景标签与锁定状态，几 KB 秒传，不碰字幕正文与正在跑的 ASR">仅同步场景标签变动（极速）</button>
           <button class="btn sec" onclick="runCloudJob('code_and_announcements')" title="仅拉代码、发布公告并重启线上服务，绝不改云端数据库">仅发布代码与公告</button>
+          <button class="btn sec" onclick="runCloudJob('backfill_metrics')" title="从云端 Nginx 历史访问日志幂等补回上线以来的真实访客数与访问次数">从 Nginx 日志补回历史访客</button>
           <button class="btn sec" onclick="runCloudJob('db_sync_only')" title="跳过抓取，直接增量比对并热同步本地与云端差异数据">仅增量同步数据库差异</button>
           <button class="btn" style="background:#059669;border-color:#059669;" onclick="runCloudJob('full_sync')" title="抓新回放 → 补录 → 场景初筛 → 增量热同步到线上">完整一键更新并同步上云</button>
         </div>

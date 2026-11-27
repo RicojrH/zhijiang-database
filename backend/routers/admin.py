@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from zhijiang_corpus.bilibili_client import BilibiliClient
 from zhijiang_corpus.clip_planner import plan_clip_job
 from zhijiang_corpus.cloud_ops import (
+    backfill_cloud_metrics,
     deploy_code_and_announcements,
     get_asr_progress,
     get_scene_edit_summary,
@@ -88,7 +89,7 @@ class SshKeySetupRequest(BaseModel):
 class CloudJobRequest(BaseModel):
     mode: str = Field(
         default="db_sync_only",
-        pattern="^(full_sync|db_sync_only|scene_tags_only|code_and_announcements)$",
+        pattern="^(full_sync|db_sync_only|scene_tags_only|code_and_announcements|backfill_metrics)$",
     )
     ssh_password: Optional[str] = Field(default=None, description="未配置免密密钥时临时传入，绝不落盘")
     ingest_limit: int = Field(default=10, ge=1, le=500)
@@ -415,6 +416,10 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
                 if body.mode == "code_and_announcements":
                     res = deploy_code_and_announcements(conf, mem_pwd, _cloud_log)
                     summary = "线上代码与公告发布完成"
+                elif body.mode == "backfill_metrics":
+                    res = backfill_cloud_metrics(conf, mem_pwd, _cloud_log)
+                    v = (res.get("backfill") or {}).get("visitors") or {}
+                    summary = f"历史访客补回完成：累计 {v.get('total_uv', 0)} 人 / {v.get('total_pv', 0)} 次"
                 elif body.mode == "scene_tags_only":
                     res = sync_scene_tags_to_cloud(
                         db,

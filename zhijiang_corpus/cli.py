@@ -19,6 +19,7 @@ from .clip_planner import plan_clip_job
 from .config import VALID_SCENE_TYPES, load_config, save_cookie_to_env
 from .db import CorpusDB
 from .ingest import ingest_bvids, ingest_from_up, ingest_local_file, seed_demo_data
+from .metrics import SiteMetricsDB
 from .normalizer import run_corpus_normalization
 from .scene_tagger import run_scene_tagging
 from .search import SearchQuery, SearchService
@@ -454,6 +455,14 @@ def cmd_apply_scene_tags(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill_metrics(args: argparse.Namespace) -> int:
+    cfg = load_config(db_path=args.db)
+    metrics_db = SiteMetricsDB(cfg.db_path.parent / "site_metrics.db")
+    res = metrics_db.import_nginx_access_logs(log_dir=args.log_dir)
+    _print_json(res)
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     cfg = load_config(db_path=args.db)
     enable_admin = not args.public_only
@@ -650,6 +659,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_atags = sub.add_parser("apply-scene-tags", help="在云端热应用纯场景标签轻量补丁（不触碰字幕正文）")
     p_atags.add_argument("patch_file", help="标签补丁路径（.json.gz）")
     p_atags.set_defaults(func=cmd_apply_scene_tags)
+
+    p_bmetrics = sub.add_parser("backfill-metrics", help="从 Nginx access.log* 幂等补回历史真实访问人数（UV/PV）")
+    p_bmetrics.add_argument("--log-dir", default="/var/log/nginx", help="Nginx 日志目录（默认 /var/log/nginx）")
+    p_bmetrics.set_defaults(func=cmd_backfill_metrics)
 
     p_serve = sub.add_parser("serve", help="启动后端 API 服务（默认本地含调试台，--public-only 为公网只读模式）")
     p_serve.add_argument("--host", default=None, help="监听地址（默认 127.0.0.1）")

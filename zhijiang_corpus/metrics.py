@@ -8,18 +8,27 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _CST = timezone(timedelta(hours=8))
 _BOT_UA_RE = re.compile(
     r"(?:bot|spider|crawl|slurp|curl/|wget/|python-httpx|python-requests|"
-    r"headless|lighthouse|pingdom|uptimerobot|statuscake|monitor|scrapy|go-http-client)",
+    r"headless|lighthouse|pingdom|uptimerobot|statuscake|monitor|scrapy|go-http-client|"
+    r"censys|zgrab|masscan|nmap|nikto|expanse|paloalto|netcraft|ahrefs|semrush|mj12bot)",
     re.IGNORECASE,
+)
+# 标准 Nginx combined 日志格式：
+# 1.2.3.4 - - [26/Nov/2026:12:34:56 +0000] "GET / HTTP/2.0" 200 1234 "ref" "UA"
+_NGINX_LINE_RE = re.compile(
+    r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<ts>[^\]]+)\]\s+'
+    r'"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+HTTP/[^"]+"\s+'
+    r'(?P<status>\d{3})\s+\S+\s+"[^"]*"\s+"(?P<ua>[^"]*)"'
 )
 
 
@@ -146,3 +155,110 @@ class SiteMetricsDB:
             return self._query_summary(conn, today)
         finally:
             conn.close()
+
+    def import_nginx_access_logs(
+        self,
+        log_dir: str | Path = "/var/log/nginx",
+        log_files: Optional[Iterable[str | Path]] = None,
+    ) -> Dict[str, Any]:
+        """幂等解析 Nginx access.log* 中的真实首页访问记录，补回上线以来的历史 UV/PV."""
+        files: List[Path] = []
+        if log_files is not None:
+            files = [Path(p) for p in log_files if Path(p).exists()]
+        else:
+            base = Path(log_dir)
+            if base.exists():
+                files = sorted(
+                    p
+                    for p in base.iterdir()
+                    if p.is_file() and p.name.startswith("access.log")
+                )
+
+        daily_pv_counts: Dict[str, int] = {}
+        daily_uv_sets: Dict[str, set[str]] = {}
+        visitor_seen: Dict[str, Tuple[str, str]] = {}
+        lines_scanned = 0
+        hits_matched = 0
+
+        for fp in files:
+            try:
+                if fp.suffix == ".gz":
+                    fh = gzip.open(fp, "rt", encoding="utf-8", errors="replace")
+                else:
+                    fh = fp.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    lines_scanned += 1
+                    m = _NGINX_LINE_RE.match(line)
+                    if not m:
+                        continue
+                    if m.group("method") != "GET":
+                        continue
+                    status = int(m.group("status"))
+                    if status not in (200, 304):
+                        continue
+                    path_only = m.group("path").split("?", 1)[0]
+                    if path_only != "/":
+                        continue
+                    ua = m.group("ua")
+                    if not ua or ua == "-" or self.is_bot(ua):
+                        continue
+                    try:
+                        dt = datetime.strptime(m.group("ts"), "%d/%b/%Y:%H:%M:%S %z")
+                    except ValueError:
+                        continue
+                    dt_cst = dt.astimezone(_CST)
+                    day = dt_cst.strftime("%Y-%m-%d")
+                    ts_utc = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    vhash = self._hash_visitor(m.group("ip"), ua)
+
+                    hits_matched += 1
+                    daily_pv_counts[day] = daily_pv_counts.get(day, 0) + 1
+                    daily_uv_sets.setdefault(day, set()).add(vhash)
+                    prev = visitor_seen.get(vhash)
+                    if prev is None:
+                        visitor_seen[vhash] = (ts_utc, ts_utc)
+                    else:
+                        visitor_seen[vhash] = (min(prev[0], ts_utc), max(prev[1], ts_utc))
+
+        today = _today_cst()
+        conn = self._connect()
+        try:
+            for day, pv in daily_pv_counts.items():
+                # 幂等写入：保留已有计数与 Nginx 日志计数中的较大值，重复回灌绝不虚增
+                conn.execute(
+                    """
+                    INSERT INTO daily_pv (visit_date, pv) VALUES (?, ?)
+                    ON CONFLICT(visit_date) DO UPDATE SET pv = MAX(pv, excluded.pv)
+                    """,
+                    (day, pv),
+                )
+            for day, hashes in daily_uv_sets.items():
+                conn.executemany(
+                    "INSERT OR IGNORE INTO daily_visitors (visit_date, visitor_hash) VALUES (?, ?)",
+                    [(day, h) for h in hashes],
+                )
+            conn.executemany(
+                """
+                INSERT INTO all_visitors (visitor_hash, first_seen, last_seen)
+                VALUES (?, ?, ?)
+                ON CONFLICT(visitor_hash) DO UPDATE SET
+                    first_seen = MIN(first_seen, excluded.first_seen),
+                    last_seen = MAX(last_seen, excluded.last_seen)
+                """,
+                [(h, fs, ls) for h, (fs, ls) in visitor_seen.items()],
+            )
+            conn.commit()
+            summary = self._query_summary(conn, today)
+        finally:
+            conn.close()
+
+        return {
+            "files_scanned": [str(f) for f in files],
+            "lines_scanned": lines_scanned,
+            "hits_matched": hits_matched,
+            "days_found": sorted(daily_pv_counts.keys()),
+            "visitors": summary,
+        }
