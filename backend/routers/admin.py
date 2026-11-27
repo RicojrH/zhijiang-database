@@ -152,6 +152,17 @@ class VoiceprintStartRequest(BaseModel):
     limit: int = Field(default=0, ge=0, le=5000)
 
 
+class ArchiveSyncStartRequest(BaseModel):
+    mode: str = Field(
+        default="erchuang_all",
+        pattern="^(erchuang_all|erchuang_tags_only|feishu_early|all|dry_run)$",
+        description="erchuang_all=二创计画补漏+校准标签, erchuang_tags_only=仅校准标签, feishu_early=飞书早期补录, all=全部, dry_run=仅预览",
+    )
+    refresh_erchuang: bool = Field(default=True, description="是否实时从 B 站刷新二创计画 10 个合集最新清单")
+    cutoff_date: str = Field(default="2021-08-19", description="飞书早期录播截止日期 YYYY-MM-DD")
+    delay: float = Field(default=0.55, ge=0.2, le=5.0, description="B 站请求间隔秒数")
+
+
 def _normalize_cookie_input(raw: str) -> str:
     text = (raw or "").strip()
     if "=" not in text and text:
@@ -581,6 +592,59 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
             if len(asr_state["logs"]) > 400:
                 asr_state["logs"] = asr_state["logs"][-400:]
 
+    def _count_external_python_procs(needle: str) -> int:
+        if sys.platform != "win32":
+            return 0
+        try:
+            out = subprocess.check_output(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | Where-Object {{ $_.CommandLine -like '*{needle}*' }} | Measure-Object).Count",
+                ],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            return int(out) if out.isdigit() else 0
+        except Exception:
+            return 0
+
+    def _recent_db_activity_logs(kind: str, limit: int = 15) -> List[str]:
+        with db.session() as conn:
+            if kind == "vp":
+                rows = conn.execute(
+                    """
+                    SELECT updated_at, up_name, bvid, page, scene_type, line_count, title
+                      FROM videos
+                     WHERE voiceprint_status = 'ok'
+                     ORDER BY updated_at DESC
+                     LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                return [
+                    f"[{str(r['updated_at'])[11:19]} UTC] ✅ 完成声纹 {r['up_name']} {r['bvid']} P{r['page']} "
+                    f"({r['scene_type']}, {r['line_count']}行) | {str(r['title'] or '')[:38]}"
+                    for r in reversed(rows)
+                ]
+            rows = conn.execute(
+                """
+                SELECT updated_at, up_name, bvid, page, subtitle_lan, line_count, title
+                  FROM videos
+                 WHERE subtitle_lan LIKE 'asr-%' AND subtitle_status = 'ok'
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [
+                f"[{str(r['updated_at'])[11:19]} UTC] ✅ 完成ASR {r['up_name']} {r['bvid']} P{r['page']} "
+                f"({r['subtitle_lan']}, {r['line_count']}行) | {str(r['title'] or '')[:38]}"
+                for r in reversed(rows)
+            ]
+
     @router.get("/asr/status", summary="查看本地 GPU ASR 补录/重录实时进度与托管状态")
     def api_asr_status() -> Dict[str, Any]:
         progress = get_asr_progress(db)
@@ -588,6 +652,17 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
             alive = [p for p in asr_procs if p.poll() is None]
             asr_state["running"] = len(alive) > 0
             state_copy = dict(asr_state)
+        if not state_copy["running"]:
+            ext_n = _count_external_python_procs("backfill-asr")
+            if ext_n > 0:
+                state_copy["running"] = True
+                state_copy["external"] = True
+                state_copy["mode"] = f"外部运行中 ({ext_n} 进程)"
+                if not state_copy["logs"]:
+                    state_copy["logs"] = [
+                        f"[外部托管] 检测到 {ext_n} 个 GPU ASR 进程正在后台运行，以下为最近完成入库的分P（每 5 秒自动刷新）：",
+                        *_recent_db_activity_logs("asr", limit=15),
+                    ]
         return {"progress": progress, "job": state_copy}
 
     @router.post("/asr/start", summary="从本地后台启动 GPU 语音补录或旧 ASR 高精度重录")
@@ -739,6 +814,17 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
             alive = [p for p in vp_procs if p.poll() is None]
             vp_state["running"] = len(alive) > 0
             st_copy = dict(vp_state)
+        if not st_copy["running"]:
+            ext_n = _count_external_python_procs("run-voiceprint")
+            if ext_n > 0:
+                st_copy["running"] = True
+                st_copy["external"] = True
+                st_copy["scope"] = f"外部运行中 ({ext_n} 进程)"
+                if not st_copy["logs"]:
+                    st_copy["logs"] = [
+                        f"[外部托管] 检测到 {ext_n} 个声纹标注进程正在后台运行，以下为最近完成标注的分P（每 5 秒自动刷新）：",
+                        *_recent_db_activity_logs("vp", limit=15),
+                    ]
         return {"progress": progress, "job": st_copy}
 
     @router.post("/voiceprint/start", summary="启动本地批量声纹发言人标注（支持断点续跑）")
@@ -865,6 +951,171 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
                     stopped += 1
         if stopped:
             _vp_log(f"已安全停止 {stopped} 个声纹标注进程（已写库的分P全部保留，随时可续跑）。")
+        return {"stopped": stopped}
+
+    # ── 第三方归档补录（飞书早期录播 + 二创计画 10 合集补漏与标签校准）──
+    archive_lock = threading.Lock()
+    archive_proc_box: List[subprocess.Popen] = []
+    archive_state: Dict[str, Any] = {
+        "running": False,
+        "mode": "",
+        "logs": [],
+        "last_summary": "",
+        "last_finished_at": None,
+    }
+
+    def _archive_log(msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        with archive_lock:
+            archive_state["logs"].append(f"[{ts}] {msg}")
+            if len(archive_state["logs"]) > 500:
+                archive_state["logs"] = archive_state["logs"][-500:]
+
+    def _get_archive_db_summary() -> Dict[str, Any]:
+        with db.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(json_extract(extra_meta, '$.archive_source'), 'official') AS src,
+                       COUNT(DISTINCT bvid) AS videos,
+                       COUNT(*) AS parts,
+                       SUM(CASE WHEN subtitle_status = 'ok' THEN 1 ELSE 0 END) AS ok_parts,
+                       SUM(CASE WHEN subtitle_status = 'no_subtitle' THEN 1 ELSE 0 END) AS no_sub_parts,
+                       COALESCE(SUM(line_count), 0) AS lines
+                  FROM videos
+                 GROUP BY src
+                """
+            ).fetchall()
+        by_src = {str(r["src"]): dict(r) for r in rows}
+        return {
+            "feishu_early": by_src.get(
+                "feishu_early",
+                {"videos": 0, "parts": 0, "ok_parts": 0, "no_sub_parts": 0, "lines": 0},
+            ),
+            "erchuang_missing": by_src.get(
+                "erchuang_missing",
+                {"videos": 0, "parts": 0, "ok_parts": 0, "no_sub_parts": 0, "lines": 0},
+            ),
+            "official": by_src.get(
+                "official",
+                {"videos": 0, "parts": 0, "ok_parts": 0, "no_sub_parts": 0, "lines": 0},
+            ),
+        }
+
+    @router.get("/archives/status", summary="查看飞书早期录播与二创计画补录/标签校准状态与日志")
+    def api_archives_status() -> Dict[str, Any]:
+        summary = _get_archive_db_summary()
+        with archive_lock:
+            alive = [p for p in archive_proc_box if p.poll() is None]
+            archive_state["running"] = len(alive) > 0
+            job_copy = dict(archive_state)
+        return {"summary": summary, "job": job_copy}
+
+    @router.post("/archives/start", summary="在后台执行飞书早期录播补录或二创计画合集补漏与标签校准")
+    def api_archives_start(body: ArchiveSyncStartRequest) -> Dict[str, Any]:
+        with archive_lock:
+            alive = [p for p in archive_proc_box if p.poll() is None]
+            if alive:
+                raise HTTPException(status_code=409, detail="当前已有归档补录/校准任务正在运行，请稍候")
+            archive_proc_box.clear()
+            archive_state["running"] = True
+            archive_state["mode"] = body.mode
+            archive_state["logs"] = []
+            archive_state["last_summary"] = ""
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        cmd = [
+            sys.executable,
+            "-u",
+            str(PROJECT_ROOT / "scripts" / "sync_archives.py"),
+            "--db",
+            str(db.db_path),
+            "--cutoff-date",
+            body.cutoff_date,
+            "--delay",
+            str(body.delay),
+        ]
+        if body.refresh_erchuang and body.mode != "feishu_early":
+            cmd.append("--refresh-erchuang")
+        if body.mode == "dry_run":
+            cmd.append("--dry-run")
+        elif body.mode == "erchuang_all":
+            cmd.append("--only-erchuang")
+        elif body.mode == "erchuang_tags_only":
+            cmd.append("--only-tags")
+        elif body.mode == "feishu_early":
+            cmd.append("--only-feishu")
+
+        def _spawn_archive() -> None:
+            try:
+                _archive_log(
+                    f"启动归档同步任务：mode={body.mode}，refresh_erchuang={body.refresh_erchuang}，"
+                    f"cutoff_date={body.cutoff_date}"
+                )
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(PROJECT_ROOT),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                with archive_lock:
+                    archive_proc_box.append(proc)
+
+                last_important = ""
+                if proc.stdout:
+                    for line in proc.stdout:
+                        txt = line.rstrip()
+                        if txt:
+                            _archive_log(txt)
+                            if any(
+                                k in txt
+                                for k in ("补录完成", "标签修正完成", "优化完成", "二创计画对齐规划")
+                            ):
+                                last_important = txt
+                rc = proc.wait()
+                summary = (
+                    last_important or f"任务完成 (exit={rc})"
+                    if rc == 0
+                    else f"任务异常退出 (exit={rc})"
+                )
+                _archive_log(f"归档同步任务结束：{summary}")
+                with archive_lock:
+                    archive_state["last_summary"] = summary
+            except Exception as exc:
+                _archive_log(f"❌ 归档同步任务异常：{exc}")
+                with archive_lock:
+                    archive_state["last_summary"] = f"异常：{exc}"
+            finally:
+                with archive_lock:
+                    archive_proc_box.clear()
+                    archive_state["running"] = False
+                    archive_state["last_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        threading.Thread(target=_spawn_archive, daemon=True).start()
+        return {"started": True, "mode": body.mode}
+
+    @router.post("/archives/stop", summary="安全停止运行中的归档补录/标签校准子进程")
+    def api_archives_stop() -> Dict[str, Any]:
+        stopped = 0
+        with archive_lock:
+            for p in archive_proc_box:
+                if p.poll() is None:
+                    if sys.platform == "win32":
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                            capture_output=True,
+                            check=False,
+                        )
+                    else:
+                        p.terminate()
+                    stopped += 1
+        if stopped:
+            _archive_log(f"已安全停止归档同步任务（已入库场次与已修改标签全部保留，随时可续跑）。")
         return {"stopped": stopped}
 
     return router

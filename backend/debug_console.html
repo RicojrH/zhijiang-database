@@ -185,6 +185,8 @@
         <button class="chip" data-up="向晚" style="border-color:#9ac8e2;color:#225f80;" onclick="toggleUp(this)">向晚</button>
         <button class="chip" data-up="心宜" style="border-color:#c93773;color:#9d2256;" onclick="toggleUp(this)">心宜</button>
         <button class="chip" data-up="思诺" style="border-color:#7252c0;color:#513399;" onclick="toggleUp(this)">思诺</button>
+        <button class="chip" data-up="A-SOUL" style="border-color:#64748b;color:#334155;" onclick="toggleUp(this)">A-SOUL</button>
+        <button class="chip" data-up="珈乐" style="border-color:#b8a6d9;color:#5b4b8a;" onclick="toggleUp(this)">珈乐</button>
       </div>
       <div class="chips" id="speakerChips" style="margin-top:8px;">
         <span style="font-size:13px;color:var(--muted);">发言人：</span>
@@ -253,6 +255,8 @@
             <option value="向晚">向晚</option>
             <option value="心宜">心宜</option>
             <option value="思诺">思诺</option>
+            <option value="A-SOUL">A-SOUL</option>
+            <option value="珈乐">珈乐</option>
           </select>
         </label>
         <label>场景：
@@ -371,6 +375,35 @@
         <button class="btn sec" style="padding:4px 10px;font-size:12px;" onclick="pollIngestStatus()">刷新日志</button>
       </div>
       <div id="ingestLog" class="log-box">暂无抓取任务日志。</div>
+    </div>
+
+    <div class="panel">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;">
+        <div>
+          <h3 style="margin:0;">3. 二创计画合集补漏 / 标签校准 &amp; 飞书早期录播补全</h3>
+          <span style="font-size:12px;color:var(--muted);">自动优先无弹幕/纯净版分P、无纯净版再回退弹幕版，并剔除防撞车末尾分P；同时以二创计画 10 个合集分类校准存量场次标签。</span>
+        </div>
+        <button class="btn sec" style="padding:5px 12px;font-size:12.5px;" onclick="pollArchiveStatus()">刷新状态</button>
+      </div>
+      <div id="archiveSummaryBox" style="font-size:13px;margin-bottom:10px;padding:10px 12px;background:#f8fafc;border:1px solid var(--border);border-radius:8px;">正在读取第三方归档入库统计...</div>
+      <div class="filters-row" style="margin-top:0;margin-bottom:10px;">
+        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
+          <input id="archRefreshEc" type="checkbox" checked /> 实时刷新二创计画 10 合集最新清单
+        </label>
+        <label>飞书早期截止日期：
+          <input id="archCutoffDate" type="date" value="2021-08-19" />
+        </label>
+        <span id="archiveStatusText" style="font-size:12.5px;color:var(--muted);">空闲</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+        <button class="btn sec" id="btnArchDry" onclick="startArchiveSync('dry_run')">仅预览检测 (Dry-Run)</button>
+        <button class="btn" id="btnArchEcAll" onclick="startArchiveSync('erchuang_all')" title="刷新二创计画 10 个合集，校准存量错误标签并补录官方缺失/被掐断场次">二创计画补漏 + 校准标签</button>
+        <button class="btn sec" id="btnArchTags" onclick="startArchiveSync('erchuang_tags_only')" title="仅对照二创计画 10 个合集修正已有数据库中的错误场景标签">仅校准场景标签</button>
+        <button class="btn sec" id="btnArchFeishu" onclick="startArchiveSync('feishu_early')" title="补录飞书表格中截止日期前的早期录播（2020 ~ 2021.8.19）">补录飞书早期录播</button>
+        <button class="btn green" id="btnArchAll" onclick="startArchiveSync('all')" title="一次性执行标签校准 + 飞书早期补录 + 二创计画缺失补录">全量同步（飞书 + 二创计画）</button>
+        <button class="btn sec" style="color:#dc2626;border-color:#fca5a5;" onclick="stopArchiveSync()">安全停止</button>
+      </div>
+      <div id="archiveLog" class="log-box" style="max-height:260px;">暂无归档补录/校准日志。</div>
     </div>
   </section>
 
@@ -593,6 +626,7 @@ let videoPage = 1;
 let videoTotalPages = 0;
 let qrTimer = null;
 let ingestTimer = null;
+let archiveTimer = null;
 let cloudTimer = null;
 let asrTimer = null;
 let vpTimer = null;
@@ -642,7 +676,7 @@ function switchTab(tab) {
     document.getElementById('tab-' + name).classList.toggle('active', name === tab);
   }
   if (tab === 'videos') loadVideos(videoPage || 1);
-  if (tab === 'ingest') { checkAuth(); pollIngestStatus(); }
+  if (tab === 'ingest') { checkAuth(); pollIngestStatus(); pollArchiveStatus(); }
   if (tab === 'cloud') { loadCloudPanel(); }
 }
 
@@ -1098,6 +1132,64 @@ async function pollIngestStatus() {
   if (!st.running && ingestTimer) { clearInterval(ingestTimer); ingestTimer = null; runSearch(0); }
 }
 
+async function pollArchiveStatus() {
+  const r = await fetch('/api/v1/admin/archives/status');
+  const data = await r.json();
+  const s = data.summary || {};
+  const j = data.job || {};
+  const fs = s.feishu_early || {};
+  const ec = s.erchuang_missing || {};
+  document.getElementById('archiveSummaryBox').innerHTML = `
+    <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;">
+      <span>飞书早期录播：<b>${fs.videos || 0}</b> 场 / <b>${fs.parts || 0}</b> 分P（字幕 ok ${fs.ok_parts || 0}，待 ASR ${fs.no_sub_parts || 0}，共 ${(fs.lines || 0).toLocaleString()} 条）</span>
+      <span>二创计画补漏：<b>${ec.videos || 0}</b> 场 / <b>${ec.parts || 0}</b> 分P（字幕 ok ${ec.ok_parts || 0}，待 ASR ${ec.no_sub_parts || 0}，共 ${(ec.lines || 0).toLocaleString()} 条）</span>
+    </div>
+  `;
+  for (const id of ['btnArchDry', 'btnArchEcAll', 'btnArchTags', 'btnArchFeishu', 'btnArchAll']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = Boolean(j.running);
+  }
+  document.getElementById('archiveStatusText').textContent = j.running
+    ? `⏳ 正在执行 [${j.mode}] ...`
+    : (j.last_finished_at ? `上次执行（${j.last_finished_at}）：${j.last_summary || '完成'}` : '空闲');
+  if (j.logs && j.logs.length) {
+    const box = document.getElementById('archiveLog');
+    box.textContent = j.logs.join('\n');
+    box.scrollTop = box.scrollHeight;
+  }
+  if (!j.running && archiveTimer) {
+    clearInterval(archiveTimer);
+    archiveTimer = null;
+    loadStats();
+  }
+}
+
+async function startArchiveSync(mode) {
+  const body = {
+    mode,
+    refresh_erchuang: document.getElementById('archRefreshEc').checked,
+    cutoff_date: document.getElementById('archCutoffDate').value || '2021-08-19',
+    delay: 0.55
+  };
+  const r = await fetch('/api/v1/admin/archives/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '启动归档同步失败'); return; }
+  pollArchiveStatus();
+  if (archiveTimer) clearInterval(archiveTimer);
+  archiveTimer = setInterval(pollArchiveStatus, 2000);
+}
+
+async function stopArchiveSync() {
+  const r = await fetch('/api/v1/admin/archives/stop', { method: 'POST' });
+  const data = await r.json();
+  await pollArchiveStatus();
+  alert(data.stopped ? '已安全停止归档补录/校准任务（已入库内容保留）' : '当前没有运行中的归档补录/校准任务');
+}
+
 async function loadCloudPanel() {
   await Promise.all([
     loadCloudConfig(),
@@ -1334,7 +1426,9 @@ async function pollAsrStatus() {
     box.textContent = j.logs.join('\n');
     box.scrollTop = box.scrollHeight;
   }
-  if (!j.running && asrTimer) {
+  if (j.running && !asrTimer) {
+    asrTimer = setInterval(pollAsrStatus, 5000);
+  } else if (!j.running && asrTimer) {
     clearInterval(asrTimer);
     asrTimer = null;
   }
@@ -1394,7 +1488,9 @@ async function pollVpStatus() {
     box.textContent = j.logs.join('\n');
     box.scrollTop = box.scrollHeight;
   }
-  if (!j.running && vpTimer) {
+  if (j.running && !vpTimer) {
+    vpTimer = setInterval(pollVpStatus, 5000);
+  } else if (!j.running && vpTimer) {
     clearInterval(vpTimer);
     vpTimer = null;
   }
