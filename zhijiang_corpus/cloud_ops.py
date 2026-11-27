@@ -551,7 +551,7 @@ def sync_database_to_cloud(
 
     if run_ingest:
         cfg = load_config(db_path=db.db_path)
-        log_cb(f"==> [1/4] 增量抓取 6 位成员最新直播回放（每人检查最近 {ingest_limit} 场）...")
+        log_cb(f"==> [1/5] 增量抓取 6 位成员最新直播回放（每人检查最近 {ingest_limit} 场）...")
         for m in cfg.members:
             s = ingest_from_up(
                 db,
@@ -567,7 +567,7 @@ def sync_database_to_cloud(
         if run_asr:
             from .asr_backfill import run_asr_backfill
 
-            log_cb("==> [2/4] 检查无字幕新分P，调用本地 GPU faster-whisper 自动补录...")
+            log_cb("==> [2/5] 检查无字幕新分P，调用本地 GPU faster-whisper 自动补录...")
             os.environ["HF_HOME"] = str(PROJECT_ROOT / "data" / "cache" / "huggingface")
             os.environ["TMP"] = str(TMP_SYNC_DIR)
             os.environ["TEMP"] = str(TMP_SYNC_DIR)
@@ -584,22 +584,31 @@ def sync_database_to_cloud(
                 progress_cb=log_cb,
             )
         else:
-            log_cb("==> [2/4] 按选项跳过本地 GPU 补录")
+            log_cb("==> [2/5] 按选项跳过本地 GPU 补录")
 
-        log_cb("==> [3/4] 执行场景初筛（仅处理未标注场次）...")
+        log_cb("==> [3/5] 执行枝江专有名词纠错与新视频场景初筛...")
+        norm_stats = run_corpus_normalization(db, dry_run=False)
+        log_cb(
+            f"  词表纠错完成：命中候选 {norm_stats.get('candidates', 0):,} 条，"
+            f"修正 {norm_stats.get('updated', 0):,} 条，去重 {norm_stats.get('dedup_deleted', 0):,} 条。"
+        )
         tagged = run_scene_tagging(db, cfg, only_unknown=True, dry_run=False)
         log_cb(f"  场景初筛完成：处理 {len(tagged)} 个分P。")
 
-    log_cb("==> [4/4] 拉取云端数据清单并计算增量差异补丁...")
+    log_cb("==> [4/5] 连接云端并同步全部增量内容..." if run_ingest else "==> 拉取云端清单并增量热同步数据库差异（零停服、不重启）...")
     TMP_SYNC_DIR.mkdir(parents=True, exist_ok=True)
     delta_file = TMP_SYNC_DIR / "web_admin_delta.json.gz"
-    delta_file.unlink(missing_ok=True)
+    tags_file = TMP_SYNC_DIR / "web_admin_scene_tags.json.gz"
+    speakers_file = TMP_SYNC_DIR / "web_admin_speakers.json.gz"
+    for f in (delta_file, tags_file, speakers_file):
+        f.unlink(missing_ok=True)
 
     client = _open_ssh_client(cloud_host, password=password)
     try:
         if run_ingest:
-            log_cb("一键更新模式：正在拉取云端最新代码...")
+            log_cb("拉取云端最新代码 (git pull --ff-only origin main)...")
             _pull_remote_code(client, app_dir, log_cb)
+
         code, out, err = _exec_remote(
             client,
             f"set -e; cd {app_dir}; .venv/bin/python run.py sync-manifest",
@@ -611,27 +620,33 @@ def sync_database_to_cloud(
 
         exp = export_delta(db, remote_manifest, delta_file)
         log_cb(
-            f"差异比对完成：本地 {exp['local_parts']} / 云端 {exp['remote_parts']} | "
+            f"字幕差异比对完成：本地 {exp['local_parts']} / 云端 {exp['remote_parts']} | "
             f"需同步 {exp['parts_changed']} 个分P（新增 {exp['parts_new']}，更新 {exp['parts_updated']}）| "
             f"字幕 {exp['subtitles_exported']:,} 条 | 补丁 {exp['delta_size_kb']} KB"
         )
 
+        # 完整一键更新同时准备人工锁定场景标签补丁（确保标签/锁定状态 100% 一致）
+        tags_exp = export_scene_tags(db, tags_file, only_locked=True) if run_ingest else None
+
         sftp = client.open_sftp()
         try:
-            if also_publish_announcements and ANNOUNCEMENTS_PATH.exists():
+            if (run_ingest or also_publish_announcements) and ANNOUNCEMENTS_PATH.exists():
                 log_cb("同步本地 config/announcements.json 到云端...")
                 sftp.put(str(ANNOUNCEMENTS_PATH), posixpath.join(app_dir, "config", "announcements.json"))
 
             apply_info: Dict[str, Any] = {"parts_applied": 0, "subtitles_inserted": 0}
             if int(exp["parts_changed"]) > 0:
                 remote_delta = "/tmp/zhijiang_delta.json.gz"
-                log_cb(f"正在通过 SFTP 上传增量补丁 ({exp['delta_size_kb']} KB)...")
+                log_cb(f"正在通过 SFTP 上传增量字幕补丁 ({exp['delta_size_kb']} KB)...")
                 sftp.put(str(delta_file), remote_delta)
+            if run_ingest and tags_exp and int(tags_exp.get("parts_exported", 0)) > 0:
+                log_cb(f"正在上传人工锁定场景标签补丁 ({tags_exp['patch_size_kb']} KB)...")
+                sftp.put(str(tags_file), "/tmp/zhijiang_full_tags.json.gz")
         finally:
             sftp.close()
 
         if int(exp["parts_changed"]) > 0:
-            log_cb("正在云端热合并入库并增量更新 FTS5 索引（零停服）...")
+            log_cb("正在云端热合并字幕入库并增量更新 FTS5 索引...")
             code, out, err = _exec_remote(
                 client,
                 f"set -e; cd {app_dir}; .venv/bin/python run.py apply-delta /tmp/zhijiang_delta.json.gz && rm -f /tmp/zhijiang_delta.json.gz",
@@ -641,18 +656,68 @@ def sync_database_to_cloud(
                 raise RuntimeError(f"云端热合并失败: {err or out}")
             apply_info = json.loads(out.strip())
             log_cb(
-                f"✅ 增量热写入完成：{apply_info.get('parts_applied', 0)} 个分P / "
+                f"✅ 字幕增量写入完成：{apply_info.get('parts_applied', 0)} 个分P / "
                 f"{apply_info.get('subtitles_inserted', 0):,} 条字幕。"
             )
         else:
-            log_cb("✅ 云端数据库已与本地 100% 一致，无需上传字幕补丁。")
+            log_cb("✅ 云端字幕库已与本地 100% 一致，无需上传字幕补丁。")
 
         if run_ingest:
-            log_cb("一键更新模式：正在重启云端 API 服务以确保最新代码与前后端一致...")
+            if tags_exp and int(tags_exp.get("parts_exported", 0)) > 0:
+                code, out, err = _exec_remote(
+                    client,
+                    f"set -e; cd {app_dir}; .venv/bin/python run.py apply-scene-tags /tmp/zhijiang_full_tags.json.gz && rm -f /tmp/zhijiang_full_tags.json.gz",
+                    timeout=120,
+                )
+                if code != 0:
+                    raise RuntimeError(f"云端同步场景标签失败: {err or out}")
+                t_ap = json.loads(out.strip())
+                log_cb(
+                    f"✅ 场景标签同步完成：更新 {t_ap.get('parts_updated', 0)} 个分P / "
+                    f"{t_ap.get('subtitles_updated', 0):,} 条字幕标签。"
+                )
+
+            # 基于字幕入库后的最新云端清单，增量同步声纹发言人标注（含人工修改/清空）
+            code, out, err = _exec_remote(
+                client,
+                f"set -e; cd {app_dir}; .venv/bin/python run.py sync-manifest",
+                timeout=120,
+            )
+            if code != 0:
+                raise RuntimeError(f"拉取云端最新清单失败: {err or out}")
+            post_manifest = json.loads(out.strip()) if out.strip() else {}
+            spk_exp = export_speakers(db, speakers_file, remote_manifest=post_manifest)
+            if int(spk_exp.get("parts_exported", 0)) > 0:
+                log_cb(
+                    f"正在同步声纹发言人标注：{spk_exp['parts_exported']} 个分P / "
+                    f"{spk_exp['lines_exported']:,} 条标签 ({spk_exp['patch_size_kb']} KB)..."
+                )
+                sftp2 = client.open_sftp()
+                try:
+                    sftp2.put(str(speakers_file), "/tmp/zhijiang_full_speakers.json.gz")
+                finally:
+                    sftp2.close()
+                code, out, err = _exec_remote(
+                    client,
+                    f"set -e; cd {app_dir}; .venv/bin/python run.py apply-speakers /tmp/zhijiang_full_speakers.json.gz && rm -f /tmp/zhijiang_full_speakers.json.gz",
+                    timeout=300,
+                )
+                if code != 0:
+                    raise RuntimeError(f"云端同步声纹标注失败: {err or out}")
+                s_ap = json.loads(out.strip())
+                log_cb(
+                    f"✅ 声纹标注同步完成：更新 {s_ap.get('parts_applied', 0)} 个分P / "
+                    f"{s_ap.get('lines_updated', 0):,} 条发言人标签。"
+                )
+            else:
+                log_cb("✅ 云端声纹发言人标注已与本地 100% 一致。")
+
+            log_cb("==> [5/5] 正在重启云端 API 服务以确保最新代码、规则、公告与数据全部生效...")
             _restart_remote_service(client, log_cb)
     finally:
         client.close()
-        delta_file.unlink(missing_ok=True)
+        for f in (delta_file, tags_file, speakers_file):
+            f.unlink(missing_ok=True)
 
     after_stats = _fetch_public_stats(pub_url)
     if after_stats:

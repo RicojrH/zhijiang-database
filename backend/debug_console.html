@@ -63,6 +63,10 @@
     button.btn:hover { background: #1d4ed8; }
     button.btn.sec { background: #fff; color: #374151; border-color: #d1d5db; font-weight: 500; }
     button.btn.sec:hover { background: #f9fafb; }
+    button.btn.orange { background: #ea580c; border-color: #ea580c; color: #fff; }
+    button.btn.orange:hover { background: #c2410c; border-color: #c2410c; }
+    button.btn.green { background: #059669; border-color: #059669; color: #fff; }
+    button.btn.green:hover { background: #047857; border-color: #047857; }
     button.btn:disabled { opacity: 0.45; cursor: not-allowed; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
     .chip {
@@ -414,12 +418,11 @@
           </label>
         </div>
         <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;">
-          <button class="btn" onclick="runCloudJob('scene_tags_only')" title="仅更新场景标签与锁定状态，几 KB 秒传，不碰字幕正文与正在跑的 ASR">仅同步场景标签变动（极速）</button>
-          <button class="btn sec" onclick="runCloudJob('speakers_only')" title="仅增量同步声纹发言人标注结果，零 FTS5 重建">仅同步声纹标注结果（极速）</button>
-          <button class="btn sec" onclick="runCloudJob('code_and_announcements')" title="仅拉代码、发布公告并重启线上服务，绝不改云端数据库">仅发布代码与公告</button>
-          <button class="btn sec" onclick="runCloudJob('backfill_metrics')" title="从云端 Nginx 历史访问日志幂等补回上线以来的真实访客数与访问次数">从 Nginx 日志补回历史访客</button>
-          <button class="btn sec" onclick="runCloudJob('db_sync_only')" title="跳过抓取，直接增量比对并热同步本地与云端差异数据">仅增量同步数据库差异</button>
-          <button class="btn" style="background:#059669;border-color:#059669;" onclick="runCloudJob('full_sync')" title="抓新回放 → 补录 → 场景初筛 → 增量热同步到线上">完整一键更新并同步上云</button>
+          <button class="btn sec" onclick="runCloudJob('scene_tags_only')" title="零停服热同步人工锁定场景标签（不拉代码、不重启服务）">仅同步场景标签变动（不重启）</button>
+          <button class="btn sec" onclick="runCloudJob('speakers_only')" title="零停服热同步声纹发言人标注结果（不拉代码、不重启服务）">仅同步声纹标注结果（不重启）</button>
+          <button class="btn sec" onclick="runCloudJob('db_sync_only')" title="零停服增量同步本地与云端字幕差异（不拉代码、不重启服务）">仅增量同步数据库差异（不重启）</button>
+          <button class="btn orange" onclick="runCloudJob('code_and_announcements')" title="拉取最新代码、同步公告并重启线上服务（会短暂断开服务约 1~2 秒）">仅发布代码与公告（会重启）</button>
+          <button class="btn green" onclick="runCloudJob('full_sync')" title="完整一键更新：抓新回放 → 补录 → 纠错/初筛 → 拉最新代码 → 同步字幕/场景标签/声纹/公告 → 重启线上服务">完整一键更新并同步上云（全量同步+重启）</button>
         </div>
         <div id="cloudStatusText" style="margin-top:10px;font-size:12.5px;color:var(--muted);">空闲</div>
       </div>
@@ -443,7 +446,7 @@
           <button class="btn sec" style="padding:6px 12px;font-size:13px;" onclick="insertSceneFixAnnouncement()">+ 一键插入今日标签修正变动</button>
           <button class="btn sec" style="padding:6px 12px;font-size:13px;" onclick="addAnnouncementRow()">+ 新增公告</button>
           <button class="btn sec" style="padding:6px 12px;font-size:13px;" onclick="saveAnnouncements(false)">仅保存到本地</button>
-          <button class="btn" style="padding:6px 12px;font-size:13px;" onclick="saveAnnouncements(true)">保存并立即发布到线上</button>
+          <button class="btn orange" style="padding:6px 12px;font-size:13px;" onclick="saveAnnouncements(true)" title="保存公告并触发代码与公告发布（会重启服务）">保存并立即发布到线上（会重启）</button>
         </div>
       </div>
       <div id="annEditorList" style="display:flex;flex-direction:column;gap:10px;"></div>

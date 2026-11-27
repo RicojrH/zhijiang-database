@@ -105,31 +105,25 @@ if (-not $SyncOnly -and -not $SkipIngest) {
     Write-Host "`n==> [1-3/4] 已跳过本地抓取，直接比对并同步本地与云端的差异数据..." -ForegroundColor DarkGray
 }
 
-# ── 第 2 步：远程拉取最新代码 + 清单比对 + 生成增量补丁包（字幕 + 声纹） ──
-Write-Host "`n==> [4/4] 拉取云端最新代码与数据清单，计算极速增量补丁..." -ForegroundColor Cyan
+# ── 第 2 步：远程拉取最新代码 + 清单比对 + 全量增量同步（字幕 + 场景标签 + 声纹 + 公告） ──
+Write-Host "`n==> [4/5] 拉取云端清单并同步全部增量内容..." -ForegroundColor Cyan
 $ManifestFile = Join-Path $Root "data\tmp_asr\remote_manifest.json"
 $DeltaFile    = Join-Path $Root "data\tmp_asr\zhijiang_delta.json.gz"
+$TagsFile     = Join-Path $Root "data\tmp_asr\zhijiang_scene_tags.json.gz"
 $SpeakersFile = Join-Path $Root "data\tmp_asr\zhijiang_speakers.json.gz"
-Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile, $SpeakersFile
+Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile, $TagsFile, $SpeakersFile
 
-# 先拉取云端最新代码（保护公告文件），并在一键更新时平滑重启云端服务（-SyncOnly 纯同步模式不拉代码也不重启）
+# 完整一键更新先拉取最新代码（-SyncOnly 纯增量同步模式不拉代码也不重启服务）
 if (-not $SyncOnly) {
-    $PullAndRestartCmd = @"
+    $PullCmd = @"
 set -e
 cd $CloudAppDir
 git checkout -- config/announcements.json 2>/dev/null || true
 git pull --ff-only -q origin main
-SVC=`$(systemctl list-unit-files --type=service --no-legend | awk '{print `$1}' | grep -iE 'zhijiang|zjdb' | head -n 1 || true)
-if [ -n "`$SVC" ]; then
-  echo "[remote] 正在重启 `$SVC ..." >&2
-  systemctl restart "`$SVC"
-  sleep 1
-  echo "[remote] 服务状态: `$(systemctl is-active "`$SVC")" >&2
-fi
 .venv/bin/python run.py sync-manifest
 "@
-    $PullAndRestartCmd = $PullAndRestartCmd -replace "`r`n", "`n"
-    $RemoteManifestJson = & ssh $CloudHost $PullAndRestartCmd
+    $PullCmd = $PullCmd -replace "`r`n", "`n"
+    $RemoteManifestJson = & ssh $CloudHost $PullCmd
 } else {
     $RemoteManifestJson = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py sync-manifest"
 }
@@ -155,12 +149,11 @@ Write-Host ("    本地分P: {0} | 云端分P: {1} | 需同步分P: {2}（新增
 
 $ApplyInfo = [pscustomobject]@{ parts_applied = 0; subtitles_inserted = 0 }
 if ([int]$ExportInfo.parts_changed -gt 0) {
-    # ── 第 3 步：秒传小补丁到服务器并 WAL 热写入（零停服） ──
     Write-Host "`n    正在上传增量字幕补丁 ($($ExportInfo.delta_size_kb) KB) 到 $CloudHost ..." -ForegroundColor Cyan
     & scp $DeltaFile "${CloudHost}:/tmp/zhijiang_delta.json.gz"
     if ($LASTEXITCODE -ne 0) { throw "SCP 上传补丁失败。" }
 
-    Write-Host "    正在云端热合并入库并增量更新 FTS5 索引（不中断公网访问）..." -ForegroundColor Cyan
+    Write-Host "    正在云端热合并入库并增量更新 FTS5 索引..." -ForegroundColor Cyan
     $ApplyOut = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py apply-delta /tmp/zhijiang_delta.json.gz && rm -f /tmp/zhijiang_delta.json.gz"
     if ($LASTEXITCODE -ne 0) { throw "云端合并补丁失败。" }
     $ApplyInfo = ($ApplyOut -join "`n") | ConvertFrom-Json
@@ -168,26 +161,64 @@ if ([int]$ExportInfo.parts_changed -gt 0) {
     Write-Host "    [OK] 字幕库已与云端 100% 一致，无需上传字幕补丁。" -ForegroundColor Green
 }
 
-# 检查并增量同步声纹发言人标注补丁（零 FTS5 重建）
-$SpkExportOut = & $Py -c "import json; from pathlib import Path; from zhijiang_corpus.config import load_config; from zhijiang_corpus.db import CorpusDB; from zhijiang_corpus.sync_delta import export_speakers; cfg=load_config(); db=CorpusDB(cfg.db_path); rm=json.loads(Path(r'$ManifestFile').read_text(encoding='utf-8')); print(json.dumps(export_speakers(db, Path(r'$SpeakersFile'), remote_manifest=rm), ensure_ascii=False))"
-if ($LASTEXITCODE -eq 0 -and $SpkExportOut) {
-    $SpkInfo = ($SpkExportOut -join "`n") | ConvertFrom-Json
-    if ([int]$SpkInfo.parts_exported -gt 0) {
-        Write-Host ("    发现新声纹标注：{0} 个分P / {1:N0} 条发言人标签（{2} KB），正在热同步..." -f `
-            $SpkInfo.parts_exported, $SpkInfo.lines_exported, $SpkInfo.patch_size_kb) -ForegroundColor Cyan
-        & scp $SpeakersFile "${CloudHost}:/tmp/zhijiang_speakers.json.gz"
-        if ($LASTEXITCODE -ne 0) { throw "SCP 上传声纹补丁失败。" }
-        $SpkApplyOut = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py apply-speakers /tmp/zhijiang_speakers.json.gz && rm -f /tmp/zhijiang_speakers.json.gz"
-        if ($LASTEXITCODE -ne 0) { throw "云端应用声纹补丁失败。" }
-        $SpkApply = ($SpkApplyOut -join "`n") | ConvertFrom-Json
-        Write-Host ("    [OK] 云端声纹标注热写入完成：{0} 个分P / {1:N0} 条发言人标签。" -f `
-            $SpkApply.parts_applied, $SpkApply.lines_updated) -ForegroundColor Green
-    } else {
-        Write-Host "    [OK] 声纹发言人标注已与云端 100% 一致。" -ForegroundColor Green
+if (-not $SyncOnly) {
+    # 同步人工锁定场景标签
+    $TagExportOut = & $Py -c "import json; from pathlib import Path; from zhijiang_corpus.config import load_config; from zhijiang_corpus.db import CorpusDB; from zhijiang_corpus.sync_delta import export_scene_tags; cfg=load_config(); db=CorpusDB(cfg.db_path); print(json.dumps(export_scene_tags(db, Path(r'$TagsFile'), only_locked=True), ensure_ascii=False))"
+    if ($LASTEXITCODE -eq 0 -and $TagExportOut) {
+        $TagInfo = ($TagExportOut -join "`n") | ConvertFrom-Json
+        if ([int]$TagInfo.parts_exported -gt 0) {
+            & scp -q $TagsFile "${CloudHost}:/tmp/zhijiang_scene_tags.json.gz"
+            $TagApplyOut = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py apply-scene-tags /tmp/zhijiang_scene_tags.json.gz && rm -f /tmp/zhijiang_scene_tags.json.gz"
+            if ($LASTEXITCODE -eq 0 -and $TagApplyOut) {
+                $TagApply = ($TagApplyOut -join "`n") | ConvertFrom-Json
+                Write-Host ("    [OK] 场景标签同步完成：更新 {0} 个分P / {1:N0} 条字幕标签。" -f $TagApply.parts_updated, $TagApply.subtitles_updated) -ForegroundColor Green
+            }
+        }
     }
+
+    # 拉取最新清单后，增量同步声纹发言人标注（含人工修改与清空）
+    $PostManifestJson = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py sync-manifest"
+    if ($LASTEXITCODE -eq 0 -and $PostManifestJson) {
+        [System.IO.File]::WriteAllText($ManifestFile, ($PostManifestJson -join "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    $SpkExportOut = & $Py -c "import json; from pathlib import Path; from zhijiang_corpus.config import load_config; from zhijiang_corpus.db import CorpusDB; from zhijiang_corpus.sync_delta import export_speakers; cfg=load_config(); db=CorpusDB(cfg.db_path); rm=json.loads(Path(r'$ManifestFile').read_text(encoding='utf-8')); print(json.dumps(export_speakers(db, Path(r'$SpeakersFile'), remote_manifest=rm), ensure_ascii=False))"
+    if ($LASTEXITCODE -eq 0 -and $SpkExportOut) {
+        $SpkInfo = ($SpkExportOut -join "`n") | ConvertFrom-Json
+        if ([int]$SpkInfo.parts_exported -gt 0) {
+            Write-Host ("    发现新声纹标注：{0} 个分P / {1:N0} 条发言人标签（{2} KB），正在同步..." -f `
+                $SpkInfo.parts_exported, $SpkInfo.lines_exported, $SpkInfo.patch_size_kb) -ForegroundColor Cyan
+            & scp $SpeakersFile "${CloudHost}:/tmp/zhijiang_speakers.json.gz"
+            if ($LASTEXITCODE -ne 0) { throw "SCP 上传声纹补丁失败。" }
+            $SpkApplyOut = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py apply-speakers /tmp/zhijiang_speakers.json.gz && rm -f /tmp/zhijiang_speakers.json.gz"
+            if ($LASTEXITCODE -ne 0) { throw "云端应用声纹补丁失败。" }
+            $SpkApply = ($SpkApplyOut -join "`n") | ConvertFrom-Json
+            Write-Host ("    [OK] 云端声纹标注写入完成：{0} 个分P / {1:N0} 条发言人标签。" -f `
+                $SpkApply.parts_applied, $SpkApply.lines_updated) -ForegroundColor Green
+        } else {
+            Write-Host "    [OK] 声纹发言人标注已与云端 100% 一致。" -ForegroundColor Green
+        }
+    }
+
+    # ── 第 5 步：全部内容同步完成后重启云端服务 ──
+    Write-Host "`n==> [5/5] 正在重启云端 API 服务以确保最新代码、规则、公告与数据全部生效..." -ForegroundColor Cyan
+    $RestartCmd = @"
+set -e
+SVC=`$(systemctl list-unit-files --type=service --no-legend | awk '{print `$1}' | grep -iE 'zhijiang|zjdb' | head -n 1 || true)
+if [ -n "`$SVC" ]; then
+  echo "[remote] restarting `$SVC ..."
+  systemctl restart "`$SVC"
+  sleep 1
+  echo "[remote] status: `$(systemctl is-active "`$SVC")"
+else
+  echo "[remote] 未找到 systemd 服务，请检查 uvicorn 进程"
+fi
+"@
+    $RestartCmd = $RestartCmd -replace "`r`n", "`n"
+    & ssh $CloudHost $RestartCmd
+    if ($LASTEXITCODE -ne 0) { throw "重启云端服务失败。" }
 }
 
-Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile, $SpeakersFile
+Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile, $TagsFile, $SpeakersFile
 
 # ── 第 4 步：自动验收公网首页实时统计数据 ──
 Write-Host "`n========================================================" -ForegroundColor Green
