@@ -209,7 +209,7 @@
     <div class="panel">
       <div class="filters-row" style="margin-top:0;">
         <label>UP 主：
-          <select id="vUpFilter" onchange="loadVideos()">
+          <select id="vUpFilter" onchange="loadVideos(1)">
             <option value="">全部</option>
             <option value="嘉然">嘉然</option>
             <option value="贝拉">贝拉</option>
@@ -220,7 +220,7 @@
           </select>
         </label>
         <label>场景：
-          <select id="vSceneFilter" onchange="loadVideos()">
+          <select id="vSceneFilter" onchange="loadVideos(1)">
             <option value="">全部</option>
             <option value="solo">solo</option>
             <option value="duo">duo</option>
@@ -230,17 +230,28 @@
           </select>
         </label>
         <label>状态：
-          <select id="vStatusFilter" onchange="loadVideos()">
+          <select id="vStatusFilter" onchange="loadVideos(1)">
             <option value="">全部</option>
             <option value="ok">ok（已入库字幕）</option>
             <option value="no_subtitle">no_subtitle</option>
             <option value="pending">pending</option>
           </select>
         </label>
-        <button class="btn sec" onclick="loadVideos()">刷新列表</button>
+        <label>每页：
+          <select id="vPageSize" onchange="loadVideos(1)">
+            <option value="50">50 条</option>
+            <option value="100" selected>100 条</option>
+            <option value="200">200 条</option>
+          </select>
+        </label>
+        <button class="btn sec" onclick="loadVideos(videoPage)">刷新列表</button>
         <button class="btn sec" onclick="triggerSceneTag()">运行轻量场景初筛</button>
         <button class="btn sec" onclick="triggerOptimizeDb()">压缩优化索引</button>
       </div>
+    </div>
+    <div class="toolbar">
+      <div id="videosSummary">共 — 个分P</div>
+      <div id="videosPagerTop" style="display:flex;gap:6px;align-items:center;"></div>
     </div>
     <div class="panel" style="padding:0;overflow:auto;">
       <table>
@@ -258,6 +269,9 @@
         </thead>
         <tbody id="videosTbody"></tbody>
       </table>
+    </div>
+    <div class="toolbar" style="justify-content:flex-end;">
+      <div id="videosPagerBottom" style="display:flex;gap:6px;align-items:center;"></div>
     </div>
   </section>
 
@@ -330,6 +344,8 @@ let selectedUps = new Set();
 let currentPage = 1;
 let totalPages = 0;
 const pageLimit = 20;
+let videoPage = 1;
+let videoTotalPages = 0;
 let qrTimer = null;
 let ingestTimer = null;
 
@@ -375,7 +391,7 @@ function switchTab(tab) {
     document.getElementById('view-' + name).classList.toggle('hidden', name !== tab);
     document.getElementById('tab-' + name).classList.toggle('active', name === tab);
   }
-  if (tab === 'videos') loadVideos();
+  if (tab === 'videos') loadVideos(videoPage || 1);
   if (tab === 'ingest') { checkAuth(); pollIngestStatus(); }
 }
 
@@ -536,7 +552,24 @@ async function toggleContext(subId, bvid, page, startSec) {
   `).join('');
 }
 
-async function loadVideos() {
+function renderVideosPagers() {
+  const html = videoTotalPages > 1 ? `
+    <button class="btn sec" style="padding:4px 9px;font-size:12px;" onclick="loadVideos(1)" ${videoPage <= 1 ? 'disabled' : ''}>首页</button>
+    <button class="btn sec" style="padding:4px 9px;font-size:12px;" onclick="loadVideos(${videoPage - 1})" ${videoPage <= 1 ? 'disabled' : ''}>上一页</button>
+    <span style="font-size:12px;">第 ${videoPage} / ${videoTotalPages} 页</span>
+    <button class="btn sec" style="padding:4px 9px;font-size:12px;" onclick="loadVideos(${videoPage + 1})" ${videoPage >= videoTotalPages ? 'disabled' : ''}>下一页</button>
+    <button class="btn sec" style="padding:4px 9px;font-size:12px;" onclick="loadVideos(${videoTotalPages})" ${videoPage >= videoTotalPages ? 'disabled' : ''}>末页</button>
+    <input type="number" min="1" max="${videoTotalPages}" value="${videoPage}" style="width:58px;padding:3px 6px;font-size:12px;" onkeydown="if(event.key==='Enter') loadVideos(parseInt(this.value||'1',10))" />
+  ` : '';
+  document.getElementById('videosPagerTop').innerHTML = html;
+  document.getElementById('videosPagerBottom').innerHTML = html;
+}
+
+async function loadVideos(page) {
+  const limit = parseInt(document.getElementById('vPageSize').value || '100', 10);
+  videoPage = Math.max(1, page || 1);
+  const offset = (videoPage - 1) * limit;
+
   const params = new URLSearchParams();
   const up = document.getElementById('vUpFilter').value;
   const sc = document.getElementById('vSceneFilter').value;
@@ -544,13 +577,26 @@ async function loadVideos() {
   if (up) params.set('up_name', up);
   if (sc) params.set('scene_type', sc);
   if (st) params.set('status', st); else params.set('status', '');
-  params.set('limit', 100);
+  params.set('limit', limit);
+  params.set('offset', offset);
   const r = await fetch('/api/v1/videos?' + params.toString());
   const data = await r.json();
+  const total = data.total || 0;
+  videoTotalPages = total > 0 ? Math.ceil(total / limit) : 0;
+  if (videoTotalPages > 0 && videoPage > videoTotalPages) {
+    return loadVideos(videoTotalPages);
+  }
+  const startNum = total === 0 ? 0 : offset + 1;
+  const endNum = offset + data.items.length;
+  document.getElementById('videosSummary').textContent =
+    `共 ${total.toLocaleString()} 个分P（当前显示 ${startNum} - ${endNum}）`;
+  renderVideosPagers();
+
   const tbody = document.getElementById('videosTbody');
   if (!data.items.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无已入库场次</td></tr>'; return; }
   tbody.innerHTML = data.items.map(v => {
     const vUrl = v.page > 1 ? `https://www.bilibili.com/video/${esc(v.bvid)}/?p=${v.page}` : `https://www.bilibili.com/video/${esc(v.bvid)}/`;
+    const lockTag = v.scene_locked ? '<span style="margin-left:4px;font-size:11px;color:var(--ok);" title="已人工锁定">🔒</span>' : '<span style="margin-left:4px;font-size:11px;color:var(--muted);"></span>';
     return `
       <tr>
         <td><b>${esc(v.up_name)}</b></td>
@@ -559,10 +605,10 @@ async function loadVideos() {
         <td>${esc(v.title)}${v.part_title ? '<br><span style="color:var(--muted);font-size:12px;">' + esc(v.part_title) + '</span>' : ''}</td>
         <td>${v.line_count}</td>
         <td>${esc(v.subtitle_status)}</td>
-        <td>
-          <select onchange="patchScene('${esc(v.bvid)}', ${v.page}, this.value)" style="padding:3px 6px;border:1px solid #d1d5db;border-radius:4px;">
+        <td style="white-space:nowrap;">
+          <select onchange="patchScene('${esc(v.bvid)}', ${v.page}, this.value, this)" style="padding:3px 6px;border:1px solid #d1d5db;border-radius:4px;">
             ${['unknown','solo','duo','group','special'].map(opt => `<option value="${opt}" ${v.scene_type===opt?'selected':''}>${opt}</option>`).join('')}
-          </select>
+          </select>${lockTag}
         </td>
         <td><button class="link-btn" onclick="searchByBvid('${esc(v.bvid)}')">搜本场</button></td>
       </tr>
@@ -576,12 +622,17 @@ function searchByBvid(bvid) {
   runSearch(1);
 }
 
-async function patchScene(bvid, page, sceneType) {
-  await fetch(`/api/v1/admin/videos/${encodeURIComponent(bvid)}/scene`, {
+async function patchScene(bvid, page, sceneType, selEl) {
+  const res = await fetch(`/api/v1/admin/videos/${encodeURIComponent(bvid)}/scene`, {
     method: 'PATCH',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ page, scene_type: sceneType, lock: true, reason: 'manual_debug_ui' })
   });
+  if (res.ok && selEl && selEl.nextElementSibling) {
+    selEl.style.borderColor = '#059669';
+    selEl.nextElementSibling.style.color = '#059669';
+    selEl.nextElementSibling.textContent = '🔒 已存';
+  }
   loadStats();
 }
 
