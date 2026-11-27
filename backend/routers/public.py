@@ -156,6 +156,10 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
             default=True,
             description="开启同音/别称/Tier 3 歧义词模糊扩展（如搜 心宜 同时命中 心仪，搜 小海诺 同时命中 小海螺）",
         ),
+        speaker_filter: bool = Query(
+            default=False,
+            description="开启声纹发言人精准筛选（隐藏电影/动画原声，选定成员时按声纹实际发言人跨频道匹配）",
+        ),
         sort: str = Query(default="date_desc", pattern="^(date_desc|date_asc|relevance)$"),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
@@ -173,6 +177,7 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
             bvid=bvid,
             include_hidden=False,  # 公网接口始终只返回 is_visible=1
             fuzzy=fuzzy,
+            speaker_filter=speaker_filter,
             context_lines=context_lines,
             sort=sort,
             limit=limit,

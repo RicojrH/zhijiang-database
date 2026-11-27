@@ -33,7 +33,9 @@ from zhijiang_corpus.cloud_ops import (
     setup_ssh_key,
     sync_database_to_cloud,
     sync_scene_tags_to_cloud,
+    sync_speakers_to_cloud,
 )
+from zhijiang_corpus.voiceprint import get_voiceprint_progress
 from zhijiang_corpus.config import PROJECT_ROOT, VALID_SCENE_TYPES, load_config, save_cookie_to_env
 from zhijiang_corpus.db import CorpusDB
 from zhijiang_corpus.ingest import ingest_bvids, ingest_from_up
@@ -89,7 +91,7 @@ class SshKeySetupRequest(BaseModel):
 class CloudJobRequest(BaseModel):
     mode: str = Field(
         default="db_sync_only",
-        pattern="^(full_sync|db_sync_only|scene_tags_only|code_and_announcements|backfill_metrics)$",
+        pattern="^(full_sync|db_sync_only|scene_tags_only|speakers_only|code_and_announcements|backfill_metrics)$",
     )
     ssh_password: Optional[str] = Field(default=None, description="未配置免密密钥时临时传入，绝不落盘")
     ingest_limit: int = Field(default=10, ge=1, le=500)
@@ -117,6 +119,13 @@ class AsrStartRequest(BaseModel):
     processes: int = Field(default=2, ge=1, le=4)
     batch_size: int = Field(default=12, ge=1, le=32)
     beam_size: int = Field(default=1, ge=1, le=5)
+    limit: int = Field(default=0, ge=0, le=5000)
+
+
+class VoiceprintStartRequest(BaseModel):
+    scope: str = Field(default="multi_and_watch", pattern="^(multi_and_watch|multi_only|all)$")
+    processes: int = Field(default=2, ge=1, le=4)
+    threads: int = Field(default=4, ge=1, le=8)
     limit: int = Field(default=0, ge=0, le=5000)
 
 
@@ -421,6 +430,19 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
                     res = backfill_cloud_metrics(conf, mem_pwd, _cloud_log)
                     v = (res.get("backfill") or {}).get("visitors") or {}
                     summary = f"历史访客补回完成：累计 {v.get('total_uv', 0)} 人 / {v.get('total_pv', 0)} 次"
+                elif body.mode == "speakers_only":
+                    res = sync_speakers_to_cloud(
+                        db,
+                        conf,
+                        mem_pwd,
+                        also_publish_announcements=body.also_publish_announcements,
+                        log_cb=_cloud_log,
+                    )
+                    ap = res.get("applied") or {}
+                    summary = (
+                        f"声纹标注同步完成：更新 {ap.get('parts_applied', 0)} 个分P / "
+                        f"{ap.get('lines_updated', 0):,} 条发言人标签"
+                    )
                 elif body.mode == "scene_tags_only":
                     res = sync_scene_tags_to_cloud(
                         db,
@@ -628,6 +650,140 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
                     stopped += 1
         if stopped:
             _asr_log(f"已发送停止信号给 {stopped} 个 GPU ASR 进程树（已写入数据库的分P全部保留）。")
+        return {"stopped": stopped}
+
+    # ── 本地声纹发言人标注控制台（支持断点续跑与多进程并行）──
+    vp_lock = threading.Lock()
+    vp_procs: List[subprocess.Popen] = []
+    vp_state: Dict[str, Any] = {
+        "running": False,
+        "scope": "",
+        "logs": [],
+        "last_finished_at": None,
+    }
+
+    def _vp_log(msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        with vp_lock:
+            vp_state["logs"].append(f"[{ts}] {msg}")
+            if len(vp_state["logs"]) > 400:
+                vp_state["logs"] = vp_state["logs"][-400:]
+
+    @router.get("/voiceprint/status", summary="查看声纹发言人标注实时进度与日志")
+    def api_voiceprint_status() -> Dict[str, Any]:
+        progress = get_voiceprint_progress(db)
+        with vp_lock:
+            alive = [p for p in vp_procs if p.poll() is None]
+            vp_state["running"] = len(alive) > 0
+            st_copy = dict(vp_state)
+        return {"progress": progress, "job": st_copy}
+
+    @router.post("/voiceprint/start", summary="启动本地批量声纹发言人标注（支持断点续跑）")
+    def api_voiceprint_start(body: VoiceprintStartRequest) -> Dict[str, Any]:
+        with vp_lock:
+            alive = [p for p in vp_procs if p.poll() is None]
+            if alive:
+                raise HTTPException(status_code=409, detail="当前已有声纹标注任务正在运行")
+            vp_procs.clear()
+            vp_state["running"] = True
+            vp_state["scope"] = body.scope
+            vp_state["logs"] = []
+
+        env = os.environ.copy()
+        tmp_dir = PROJECT_ROOT / "data" / "tmp_asr"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        env["TMP"] = str(tmp_dir)
+        env["TEMP"] = str(tmp_dir)
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        py = sys.executable
+        n_procs = max(1, min(4, int(body.processes)))
+
+        def _spawn_vp() -> None:
+            try:
+                _vp_log(
+                    f"启动声纹发言人标注：scope={body.scope}，并行进程={n_procs}，每进程线程={body.threads}"
+                )
+                local_procs: List[subprocess.Popen] = []
+                for idx in range(n_procs):
+                    cmd = [
+                        py,
+                        "-u",
+                        "run.py",
+                        "run-voiceprint",
+                        "--scope",
+                        body.scope,
+                        "--limit",
+                        str(body.limit),
+                        "--threads",
+                        str(body.threads),
+                        "--prefetch",
+                        "2",
+                    ]
+                    if n_procs > 1:
+                        cmd.extend(["--shard-index", str(idx), "--shard-total", str(n_procs)])
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(PROJECT_ROOT),
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    local_procs.append(proc)
+                    with vp_lock:
+                        vp_procs.append(proc)
+
+                def _pump(p: subprocess.Popen, shard: int) -> None:
+                    if not p.stdout:
+                        return
+                    for line in p.stdout:
+                        txt = line.rstrip()
+                        if txt:
+                            prefix = f"[VP#{shard + 1}] " if n_procs > 1 else ""
+                            _vp_log(f"{prefix}{txt}")
+
+                threads_p = [
+                    threading.Thread(target=_pump, args=(p, i), daemon=True)
+                    for i, p in enumerate(local_procs)
+                ]
+                for t in threads_p:
+                    t.start()
+                for p in local_procs:
+                    p.wait()
+                for t in threads_p:
+                    t.join(timeout=2)
+                _vp_log("声纹发言人标注任务已结束。")
+            except Exception as exc:
+                _vp_log(f"❌ 声纹任务异常：{exc}")
+            finally:
+                with vp_lock:
+                    vp_procs.clear()
+                    vp_state["running"] = False
+                    vp_state["last_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        threading.Thread(target=_spawn_vp, daemon=True).start()
+        return {"started": True, "scope": body.scope, "processes": n_procs}
+
+    @router.post("/voiceprint/stop", summary="安全停止声纹发言人标注进程树")
+    def api_voiceprint_stop() -> Dict[str, Any]:
+        stopped = 0
+        with vp_lock:
+            for p in vp_procs:
+                if p.poll() is None:
+                    if sys.platform == "win32":
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                            capture_output=True,
+                            check=False,
+                        )
+                    else:
+                        p.terminate()
+                    stopped += 1
+        if stopped:
+            _vp_log(f"已安全停止 {stopped} 个声纹标注进程（已写库的分P全部保留，随时可续跑）。")
         return {"stopped": stopped}
 
     return router

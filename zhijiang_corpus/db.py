@@ -35,6 +35,7 @@ class VideoRecord:
     scene_confidence: float = 0.0
     scene_reason: str = ""
     scene_locked: int = 0
+    voiceprint_status: str = ""
     is_visible: int = 1
     extra_meta: Dict[str, Any] | str = "{}"
 
@@ -49,6 +50,8 @@ class SubtitleRow:
     end_sec: float
     content: str
     scene_type: str = "unknown"
+    speaker_name: str = ""
+    speaker_conf: float = 0.0
     is_visible: int = 1
     source: str = "bilibili_ai"
 
@@ -86,6 +89,15 @@ class CorpusDB:
         schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
         with self.session() as conn:
             conn.executescript(schema_sql)
+            # 无损向后兼容迁移：为历史数据库自动补充声纹标注列（SQLite 元数据级 ALTER，毫秒完成）
+            v_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(videos)").fetchall()}
+            if "voiceprint_status" not in v_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN voiceprint_status TEXT NOT NULL DEFAULT ''")
+            s_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(subtitles)").fetchall()}
+            if "speaker_name" not in s_cols:
+                conn.execute("ALTER TABLE subtitles ADD COLUMN speaker_name TEXT NOT NULL DEFAULT ''")
+            if "speaker_conf" not in s_cols:
+                conn.execute("ALTER TABLE subtitles ADD COLUMN speaker_conf REAL NOT NULL DEFAULT 0.0")
 
     def get_video(self, bvid: str, page: int = 1) -> Optional[Dict[str, Any]]:
         with self.session() as conn:
@@ -279,6 +291,8 @@ class CorpusDB:
                     s.content,
                     tokenize_for_fts(s.content),
                     effective_scene if s.scene_type == "unknown" else s.scene_type,
+                    s.speaker_name,
+                    round(float(s.speaker_conf or 0.0), 3),
                     effective_visible,
                     s.source,
                 )
@@ -290,8 +304,8 @@ class CorpusDB:
                 INSERT OR IGNORE INTO subtitles (
                     up_name, bvid, page, pub_date,
                     start_sec, end_sec, content, content_fts,
-                    scene_type, is_visible, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    scene_type, speaker_name, speaker_conf, is_visible, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows_to_insert,
             )

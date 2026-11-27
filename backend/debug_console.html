@@ -384,6 +384,7 @@
         </div>
         <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;">
           <button class="btn" onclick="runCloudJob('scene_tags_only')" title="仅更新场景标签与锁定状态，几 KB 秒传，不碰字幕正文与正在跑的 ASR">仅同步场景标签变动（极速）</button>
+          <button class="btn sec" onclick="runCloudJob('speakers_only')" title="仅增量同步声纹发言人标注结果，零 FTS5 重建">仅同步声纹标注结果（极速）</button>
           <button class="btn sec" onclick="runCloudJob('code_and_announcements')" title="仅拉代码、发布公告并重启线上服务，绝不改云端数据库">仅发布代码与公告</button>
           <button class="btn sec" onclick="runCloudJob('backfill_metrics')" title="从云端 Nginx 历史访问日志幂等补回上线以来的真实访客数与访问次数">从 Nginx 日志补回历史访客</button>
           <button class="btn sec" onclick="runCloudJob('db_sync_only')" title="跳过抓取，直接增量比对并热同步本地与云端差异数据">仅增量同步数据库差异</button>
@@ -449,6 +450,39 @@
       </div>
       <div id="asrLog" class="log-box" style="max-height:220px;">暂无由本后台启动的 ASR 任务日志（若你在外部命令行启动了重录，上方进度条仍会实时同步数据库进度）。</div>
     </div>
+
+    <div class="panel">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;">
+        <div>
+          <h3 style="margin:0;">5. 声纹发言人标注控制台（CAM++ + WeSpeaker 跨时期融合）</h3>
+          <span style="font-size:12px;color:var(--muted);">为多人场与影厅/观影反应回逐行标注实际发言人（嘉然/贝拉/乃琳/向晚/心宜/思诺/双人重叠/其他原声），支持断点续跑。</span>
+        </div>
+        <button class="btn sec" style="padding:5px 12px;font-size:12.5px;" onclick="pollVpStatus()">刷新声纹进度</button>
+      </div>
+      <div id="vpProgressBox" style="font-size:13px;margin-bottom:10px;padding:10px 12px;background:#f8fafc;border:1px solid var(--border);border-radius:8px;">正在读取声纹标注进度...</div>
+      <div class="filters-row" style="margin-top:0;margin-bottom:10px;">
+        <label>标注范围：
+          <select id="vpScope">
+            <option value="multi_and_watch" selected>多人场 + 影厅/观影/电台反应回（推荐）</option>
+            <option value="multi_only">仅双播 / 团播 / 特别场</option>
+            <option value="all">全库全部场次</option>
+          </select>
+        </label>
+        <label>并行进程：
+          <select id="vpProcs">
+            <option value="1">1 进程</option>
+            <option value="2" selected>2 进程（推荐）</option>
+            <option value="3">3 进程（高配 CPU）</option>
+          </select>
+        </label>
+        <label>每进程线程：
+          <input id="vpThreads" type="number" value="4" min="1" max="8" style="width:62px;" />
+        </label>
+        <button class="btn" onclick="startVpJob()">启动声纹标注（断点续跑）</button>
+        <button class="btn sec" style="color:#dc2626;border-color:#fca5a5;" onclick="stopVpJob()">安全停止声纹任务</button>
+      </div>
+      <div id="vpLog" class="log-box" style="max-height:220px;">暂无声纹标注日志。</div>
+    </div>
   </section>
 </main>
 
@@ -463,6 +497,7 @@ let qrTimer = null;
 let ingestTimer = null;
 let cloudTimer = null;
 let asrTimer = null;
+let vpTimer = null;
 let annItems = [];
 let sceneSummary = { today_locked_bvids: 0, today_locked_parts: 0, total_locked_bvids: 0, total_locked_parts: 0 };
 
@@ -844,7 +879,8 @@ async function loadCloudPanel() {
     loadSceneSummary(),
     loadAnnouncementsEditor(),
     pollCloudStatus(),
-    pollAsrStatus()
+    pollAsrStatus(),
+    pollVpStatus()
   ]);
 }
 
@@ -1104,6 +1140,62 @@ async function stopAsrJob() {
   const data = await r.json();
   await pollAsrStatus();
   alert(data.stopped ? `已安全停止 ${data.stopped} 个后台 GPU ASR 进程` : '当前没有由本后台启动的 ASR 进程（如在外部命令行启动请直接 Ctrl+C）');
+}
+
+async function pollVpStatus() {
+  const r = await fetch('/api/v1/admin/voiceprint/status');
+  const data = await r.json();
+  const p = data.progress || {};
+  const j = data.job || {};
+  const readyTag = p.model_ready
+    ? '<span style="color:var(--ok);font-weight:600;">模型就绪</span>'
+    : '<span style="color:var(--warn);font-weight:600;">缺少声纹模型</span>';
+  document.getElementById('vpProgressBox').innerHTML = `
+    <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
+      <span>状态：${readyTag}</span>
+      <span>目标进度：<b>${p.done_parts || 0} / ${p.targets_total || 0}</b> 个分P（<b>${p.pct_parts || 0}%</b>，剩 ${p.remaining_hours || 0} 小时）</span>
+      <span>已标注字幕：<b>${(p.all_done_lines || 0).toLocaleString()}</b> 条</span>
+      <span>后台任务：<b>${j.running ? '运行中 (' + esc(j.scope) + ')' : '空闲'}</b></span>
+    </div>
+    <div style="margin-top:8px;height:8px;background:#e5e7eb;border-radius:999px;overflow:hidden;">
+      <div style="height:100%;width:${Math.min(100, p.pct_parts || 0)}%;background:#059669;transition:width 0.3s;"></div>
+    </div>
+  `;
+  if (j.logs && j.logs.length) {
+    const box = document.getElementById('vpLog');
+    box.textContent = j.logs.join('\n');
+    box.scrollTop = box.scrollHeight;
+  }
+  if (!j.running && vpTimer) {
+    clearInterval(vpTimer);
+    vpTimer = null;
+  }
+}
+
+async function startVpJob() {
+  const body = {
+    scope: document.getElementById('vpScope').value || 'multi_and_watch',
+    processes: parseInt(document.getElementById('vpProcs').value || '2', 10),
+    threads: parseInt(document.getElementById('vpThreads').value || '4', 10),
+    limit: 0
+  };
+  const r = await fetch('/api/v1/admin/voiceprint/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '启动声纹标注失败'); return; }
+  pollVpStatus();
+  if (vpTimer) clearInterval(vpTimer);
+  vpTimer = setInterval(pollVpStatus, 3000);
+}
+
+async function stopVpJob() {
+  const r = await fetch('/api/v1/admin/voiceprint/stop', { method: 'POST' });
+  const data = await r.json();
+  await pollVpStatus();
+  alert(data.stopped ? `已安全停止 ${data.stopped} 个声纹标注进程（已写库的分P全部保留）` : '当前没有运行中的声纹标注任务');
 }
 
 document.getElementById('qInput').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(1); });

@@ -8,7 +8,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .db import CorpusDB
 from .tokenizer import tokenize_for_fts
@@ -32,6 +32,7 @@ VIDEO_COLS = (
     "scene_confidence",
     "scene_reason",
     "scene_locked",
+    "voiceprint_status",
     "is_visible",
     "extra_meta",
     "created_at",
@@ -45,12 +46,13 @@ def _part_key(bvid: str, page: int) -> str:
 
 def build_manifest(db: CorpusDB) -> Dict[str, Dict[str, Any]]:
     """导出当前数据库所有分 P 的轻量签名清单（3,300+ 行耗时 <5ms，约 50KB）."""
+    db.init_db()
     manifest: Dict[str, Dict[str, Any]] = {}
     with db.session() as conn:
         rows = conn.execute(
             """
             SELECT bvid, page, updated_at, line_count,
-                   subtitle_status, scene_type, is_visible
+                   subtitle_status, scene_type, voiceprint_status, is_visible
               FROM videos
             """
         ).fetchall()
@@ -60,6 +62,7 @@ def build_manifest(db: CorpusDB) -> Dict[str, Dict[str, Any]]:
                 "line_count": int(r["line_count"] or 0),
                 "subtitle_status": str(r["subtitle_status"] or ""),
                 "scene_type": str(r["scene_type"] or ""),
+                "voiceprint_status": str(r["voiceprint_status"] or ""),
                 "is_visible": int(r["is_visible"] if r["is_visible"] is not None else 1),
             }
     return manifest
@@ -68,7 +71,7 @@ def build_manifest(db: CorpusDB) -> Dict[str, Dict[str, Any]]:
 def _is_part_changed(local_entry: Dict[str, Any], remote_entry: Dict[str, Any] | None) -> bool:
     if remote_entry is None:
         return True
-    for field in ("line_count", "subtitle_status", "scene_type", "is_visible"):
+    for field in ("line_count", "subtitle_status", "scene_type", "voiceprint_status", "is_visible"):
         if local_entry.get(field) != remote_entry.get(field):
             return True
     if str(local_entry.get("updated_at") or "") > str(remote_entry.get("updated_at") or ""):
@@ -113,7 +116,8 @@ def export_delta(
                     continue
                 srows = conn.execute(
                     """
-                    SELECT start_sec, end_sec, content, scene_type, is_visible, source
+                    SELECT start_sec, end_sec, content, scene_type, is_visible, source,
+                           speaker_name, speaker_conf
                       FROM subtitles
                      WHERE bvid = ? AND page = ?
                      ORDER BY start_sec ASC, id ASC
@@ -128,6 +132,8 @@ def export_delta(
                         str(s["scene_type"]),
                         int(s["is_visible"]),
                         str(s["source"]),
+                        str(s["speaker_name"] or ""),
+                        round(float(s["speaker_conf"] or 0.0), 3),
                     ]
                     for s in srows
                 ]
@@ -173,6 +179,7 @@ def apply_delta(
     optimize: bool = False,
 ) -> Dict[str, Any]:
     """在云端数据库上热应用增量补丁包（SQLite WAL 事务 + FTS5 触发器自动同步，零停服）."""
+    db.init_db()
     path = Path(delta_path)
     if not path.exists():
         raise FileNotFoundError(f"增量补丁文件不存在: {path}")
@@ -223,6 +230,8 @@ def apply_delta(
                             str(s[2]),
                             tokenize_for_fts(str(s[2])),
                             str(s[3]),
+                            str(s[6]) if len(s) > 6 else "",
+                            round(float(s[7]), 3) if len(s) > 7 else 0.0,
                             int(s[4]),
                             str(s[5]),
                         )
@@ -233,8 +242,8 @@ def apply_delta(
                         INSERT OR IGNORE INTO subtitles (
                             up_name, bvid, page, pub_date,
                             start_sec, end_sec, content, content_fts,
-                            scene_type, is_visible, source
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            scene_type, speaker_name, speaker_conf, is_visible, source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         rows_to_insert,
                     )
@@ -248,6 +257,8 @@ def apply_delta(
                     actual_count = 0
 
                 v["line_count"] = actual_count
+                if "voiceprint_status" not in v or v["voiceprint_status"] is None:
+                    v["voiceprint_status"] = ""
                 conn.execute(upsert_sql, [v.get(c) for c in VIDEO_COLS])
                 parts_applied += 1
                 subtitles_inserted += actual_count
@@ -434,4 +445,131 @@ def apply_scene_tags(db: CorpusDB, patch_path: str | Path) -> Dict[str, Any]:
             "date_max": st["date_max"],
             "latest_updated_at": st.get("latest_updated_at"),
         },
+    }
+
+
+def export_speakers(
+    db: CorpusDB,
+    out_path: str | Path,
+    *,
+    remote_manifest: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """导出纯声纹发言人标注轻量补丁（不含字幕文本、零 FTS5 重建，仅携带起止秒数与 speaker_name/conf）."""
+    db.init_db()
+    with db.session() as conn:
+        parts = conn.execute(
+            """
+            SELECT bvid, page
+              FROM videos
+             WHERE voiceprint_status = 'ok'
+             ORDER BY bvid ASC, page ASC
+            """
+        ).fetchall()
+
+        payload_parts: List[Dict[str, Any]] = []
+        lines_total = 0
+        for p in parts:
+            bvid = str(p["bvid"])
+            page = int(p["page"])
+            if remote_manifest is not None:
+                rem = remote_manifest.get(_part_key(bvid, page))
+                if rem and str(rem.get("voiceprint_status") or "") == "ok":
+                    continue
+            srows = conn.execute(
+                """
+                SELECT start_sec, end_sec, speaker_name, speaker_conf
+                  FROM subtitles
+                 WHERE bvid = ? AND page = ? AND speaker_name != ''
+                 ORDER BY start_sec ASC, id ASC
+                """,
+                (bvid, page),
+            ).fetchall()
+            compact = [
+                [
+                    round(float(r["start_sec"]), 2),
+                    round(float(r["end_sec"]), 2),
+                    str(r["speaker_name"]),
+                    round(float(r["speaker_conf"] or 0.0), 3),
+                ]
+                for r in srows
+            ]
+            lines_total += len(compact)
+            payload_parts.append({"bvid": bvid, "page": page, "rows": compact})
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "type": "speakers",
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "parts_count": len(payload_parts),
+        "lines_count": lines_total,
+        "parts": payload_parts,
+    }
+    raw_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    out.write_bytes(gzip.compress(raw_bytes, compresslevel=6))
+    return {
+        "parts_exported": len(payload_parts),
+        "lines_exported": lines_total,
+        "patch_size_kb": round(out.stat().st_size / 1024.0, 2),
+        "out_path": str(out),
+    }
+
+
+def apply_speakers(db: CorpusDB, patch_path: str | Path) -> Dict[str, Any]:
+    """在云端 WAL 模式下极速热更新声纹发言人标注（不触发 FTS5 索引重写，零停服）."""
+    db.init_db()
+    p = Path(patch_path)
+    if not p.exists():
+        raise FileNotFoundError(f"找不到声纹补丁文件: {p}")
+
+    raw = p.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    payload = json.loads(raw.decode("utf-8"))
+    parts = payload.get("parts") or []
+
+    parts_applied = 0
+    lines_updated = 0
+
+    if parts:
+        with db.session() as conn:
+            for item in parts:
+                bvid = str(item["bvid"])
+                page = int(item["page"])
+                rows = item.get("rows") or []
+                if rows:
+                    conn.executemany(
+                        """
+                        UPDATE subtitles
+                           SET speaker_name = ?, speaker_conf = ?
+                         WHERE bvid = ? AND page = ? AND start_sec = ? AND end_sec = ?
+                        """,
+                        [
+                            (str(r[2]), round(float(r[3]), 3), bvid, page, round(float(r[0]), 2), round(float(r[1]), 2))
+                            for r in rows
+                        ],
+                    )
+                    lines_updated += len(rows)
+                conn.execute(
+                    """
+                    UPDATE videos
+                       SET voiceprint_status = 'ok',
+                           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                     WHERE bvid = ? AND page = ?
+                    """,
+                    (bvid, page),
+                )
+                parts_applied += 1
+
+        conn = db.connect()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        finally:
+            conn.close()
+
+    return {
+        "status": "ok",
+        "parts_applied": parts_applied,
+        "lines_updated": lines_updated,
     }

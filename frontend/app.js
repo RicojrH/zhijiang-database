@@ -553,12 +553,15 @@
     const bv = $("bvidFilter").value.trim();
     const sort = $("sortFilter").value;
     const fuzzy = $("fuzzyToggle").checked;
+    const speakerToggleEl = $("speakerFilterToggle");
+    const speakerFilter = Boolean(speakerToggleEl && speakerToggleEl.checked);
 
     if (df) params.set("date_from", df);
     if (dt) params.set("date_to", dt);
     if (bv) params.set("bvid", bv);
     params.set("sort", sort);
     params.set("fuzzy", fuzzy ? "true" : "false");
+    params.set("speaker_filter", speakerFilter ? "true" : "false");
     params.set("limit", String(state.pageLimit));
     params.set("offset", String(offset));
 
@@ -605,6 +608,19 @@
       $("hitList").innerHTML = data.items.map((it) => {
         const t = getTheme(it.up_name);
         const sceneName = SCENE_LABELS[it.scene_type] || it.scene_type;
+        let speakerBadge = "";
+        if (it.speaker_name) {
+          const pct = Math.round(Number(it.speaker_conf || 0) * 100);
+          if (it.speaker_name === "其他/原声") {
+            speakerBadge = `<span class="badge badge-speaker-other" title="声纹判定为非本库 6 位成员人声（如电影/动画/游戏原声或嘉宾）">声纹: 其他/原声</span>`;
+          } else if (it.speaker_name === it.up_name) {
+            speakerBadge = `<span class="badge badge-speaker-ok" title="声纹确认本人发言（置信度 ${pct}%）">声纹: 本人 ✓</span>`;
+          } else {
+            const firstSp = String(it.speaker_name).split("+")[0];
+            const st = getTheme(firstSp);
+            speakerBadge = `<span class="badge badge-speaker" style="--sp-color:${st.color};--sp-bg:${st.bg};--sp-ink:${st.ink};" title="声纹识别实际发言人（置信度 ${pct}%）">发言: ${esc(it.speaker_name)}</span>`;
+          }
+        }
         return `
           <article class="hit-card" data-up="${esc(it.up_name)}" style="--m-color:${t.color};--m-bg:${t.bg};--m-ink:${t.ink};">
             <div class="hit-meta">
@@ -613,6 +629,7 @@
                 ${esc(it.up_name)}
               </span>
               <span class="badge badge-scene">${esc(sceneName)}</span>
+              ${speakerBadge}
               <span class="badge badge-time">${esc(it.start_hms)} ~ ${esc(it.end_hms)}</span>
               <span>${esc(it.pub_date)}</span>
               <span>${esc(it.bvid)} · P${it.page}</span>
@@ -695,12 +712,18 @@
         box.textContent = "暂无上下文记录。";
         return;
       }
-      box.innerHTML = data.items.map((x) => `
+      box.innerHTML = data.items.map((x) => {
+        const spHtml = x.speaker_name
+          ? `<span class="ctx-speaker">[${esc(x.speaker_name)}]</span>`
+          : "";
+        return `
         <div class="ctx-row ${x.id === subId ? "is-hit" : ""}">
           <span class="ctx-ts">${Number(x.start_sec).toFixed(1)}s</span>
+          ${spHtml}
           <span>${esc(x.content)}</span>
         </div>
-      `).join("");
+      `;
+      }).join("");
     } catch (e) {
       box.textContent = "加载上下文失败。";
     }
@@ -759,6 +782,8 @@
     $("bvidFilter").value = "";
     $("sortFilter").value = "date_desc";
     $("fuzzyToggle").checked = true;
+    const spToggle = $("speakerFilterToggle");
+    if (spToggle) spToggle.checked = false;
     state.selectedUps.clear();
     state.selectedScenes.clear();
     applyThemeAccent();
@@ -817,10 +842,13 @@
       });
     }
 
-    ["dateFrom", "dateTo", "sortFilter", "pageSizeFilter", "fuzzyToggle"].forEach((id) => {
-      $(id).addEventListener("change", () => {
-        if (hasActiveQueryCondition()) runSearch(1, false);
-      });
+    ["dateFrom", "dateTo", "sortFilter", "pageSizeFilter", "fuzzyToggle", "speakerFilterToggle"].forEach((id) => {
+      const el = $(id);
+      if (el) {
+        el.addEventListener("change", () => {
+          if (hasActiveQueryCondition()) runSearch(1, false);
+        });
+      }
     });
 
     $("bvidFilter").addEventListener("keydown", (e) => {

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS videos (
     scene_confidence  REAL    NOT NULL DEFAULT 0.0,      -- 初筛置信度 0.0 ~ 1.0
     scene_reason      TEXT    NOT NULL DEFAULT '',       -- 规则初筛依据（JSON 摘要）
     scene_locked      INTEGER NOT NULL DEFAULT 0,        -- 1=人工确认锁定，自动初筛不覆盖
+    voiceprint_status TEXT    NOT NULL DEFAULT '',       -- '' | ok | skipped | failed（声纹发言人标注状态）
     is_visible        INTEGER NOT NULL DEFAULT 1,        -- 1=可见，0=隐藏/软删除
     extra_meta        TEXT    NOT NULL DEFAULT '{}',     -- 扩展字段（JSON：简介摘要、识别到的出场成员等）
     created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -58,6 +59,8 @@ CREATE TABLE IF NOT EXISTS subtitles (
     content           TEXT    NOT NULL,                  -- 清洗后的可读字幕正文
     content_fts       TEXT    NOT NULL DEFAULT '',       -- 中英混排字符级分词文本（供 FTS5 索引）
     scene_type        TEXT    NOT NULL DEFAULT 'unknown',
+    speaker_name      TEXT    NOT NULL DEFAULT '',       -- 声纹识别发言人（如 嘉然 / 嘉然+乃琳 / 其他/原声 / 空=未标注）
+    speaker_conf      REAL    NOT NULL DEFAULT 0.0,      -- 声纹识别置信度 0.0 ~ 1.0
     is_visible        INTEGER NOT NULL DEFAULT 1,
     source            TEXT    NOT NULL DEFAULT 'bilibili_ai', -- bilibili_ai | bilibili_cc | local_import | whisper
     created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),

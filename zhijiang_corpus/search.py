@@ -19,6 +19,7 @@ class SearchQuery:
     bvid: Optional[str] = None
     include_hidden: bool = False
     fuzzy: bool = True
+    speaker_filter: bool = False
     context_lines: int = 0
     clip_pad_before: float = 1.5
     clip_pad_after: float = 1.5
@@ -82,8 +83,26 @@ class SearchService:
             cleaned_ups = [u.strip() for u in req.up_names if u and u.strip()]
             if cleaned_ups:
                 placeholders = ",".join("?" for _ in cleaned_ups)
-                where_clauses.append(f"s.up_name IN ({placeholders})")
-                params.extend(cleaned_ups)
+                if req.speaker_filter:
+                    # 声纹发言人精准筛选：
+                    # 1) 已做声纹标注的行：按实际发言人匹配（含单人及 A+B 双人重叠/换人，且跨频道捞出本人发言）
+                    # 2) 未做声纹标注的纯单播行：平滑回退至录播频道 up_name
+                    sp_checks = []
+                    for u in cleaned_ups:
+                        sp_checks.append(
+                            "(s.speaker_name = ? OR s.speaker_name LIKE ? OR s.speaker_name LIKE ?)"
+                        )
+                        params.extend([u, f"{u}+%", f"%+{u}"])
+                    where_clauses.append(
+                        f"(({' OR '.join(sp_checks)}) OR (s.speaker_name = '' AND s.scene_type = 'solo' AND s.up_name IN ({placeholders})))"
+                    )
+                    params.extend(cleaned_ups)
+                else:
+                    where_clauses.append(f"s.up_name IN ({placeholders})")
+                    params.extend(cleaned_ups)
+
+        if req.speaker_filter:
+            where_clauses.append("s.speaker_name != '其他/原声'")
 
         if req.date_from:
             where_clauses.append("s.pub_date >= ?")
@@ -150,6 +169,8 @@ class SearchService:
                 s.end_sec,
                 s.content,
                 s.scene_type,
+                s.speaker_name,
+                s.speaker_conf,
                 s.is_visible,
                 s.source,
                 COALESCE(v.title, '') AS title,
@@ -187,6 +208,8 @@ class SearchService:
                     "end_hms": format_sec_hms(end_sec),
                     "content": r["content"],
                     "scene_type": r["scene_type"],
+                    "speaker_name": str(r["speaker_name"] or ""),
+                    "speaker_conf": round(float(r["speaker_conf"] or 0.0), 3),
                     "is_visible": int(r["is_visible"]),
                     "title": r["title"],
                     "part_title": r["part_title"],
@@ -324,7 +347,7 @@ class SearchService:
             ).fetchone()
             rows = conn.execute(
                 f"""
-                SELECT id, start_sec, end_sec, content, scene_type, is_visible
+                SELECT id, start_sec, end_sec, content, scene_type, speaker_name, speaker_conf, is_visible
                   FROM subtitles
                  WHERE {' AND '.join(clauses)}
                  ORDER BY start_sec ASC, id ASC

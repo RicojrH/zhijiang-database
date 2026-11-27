@@ -299,6 +299,7 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     assert pub_client.get("/api/v1/admin/cloud/config").status_code == 404
     assert pub_client.get("/api/v1/admin/announcements").status_code == 404
     assert pub_client.get("/api/v1/admin/asr/status").status_code == 404
+    assert pub_client.get("/api/v1/admin/voiceprint/status").status_code == 404
     assert pub_client.patch(
         "/api/v1/admin/videos/BV1DEMO000001/scene",
         json={"page": 1, "scene_type": "special"},
@@ -436,6 +437,37 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     assert ap_tag["parts_updated"] == 1
     assert cloud_db.get_video("BV1DEMO000001", 1)["scene_type"] == "special"
     assert cloud_db.get_video("BV1DEMO000001", 1)["scene_locked"] == 1
+
+    # 4. 声纹发言人先验、精准发言人过滤、以及纯声纹云端轻量补丁校验
+    from zhijiang_corpus.sync_delta import apply_speakers, export_speakers
+    from zhijiang_corpus.voiceprint import active_candidates_for_video
+
+    assert "心宜" not in active_candidates_for_video(up_name="嘉然", pub_date="2022-08-01", scene_type="group")
+    assert "向晚" not in active_candidates_for_video(up_name="嘉然", pub_date="2026-08-01", scene_type="group")
+    assert active_candidates_for_video(up_name="贝拉", pub_date="2026-11-01", scene_type="solo") == ["贝拉"]
+    assert active_candidates_for_video(up_name="心宜", pub_date="2026-08-09", scene_type="duo", title="【双人电台】") == ["心宜", "思诺"]
+
+    vp_st = loc_client.get("/api/v1/admin/voiceprint/status").json()
+    assert "progress" in vp_st and "job" in vp_st
+
+    # 模拟本地写入声纹标注（含双人重叠与 其他/原声），验证 speaker_filter 跨频道检索与轻量同步补丁
+    with db.session() as conn:
+        sub_ids = [r[0] for r in conn.execute("SELECT id FROM subtitles WHERE bvid='BV1DEMO000001' ORDER BY start_sec").fetchall()]
+        conn.execute("UPDATE subtitles SET speaker_name='嘉然+乃琳', speaker_conf=0.88 WHERE id=?", (sub_ids[0],))
+        if len(sub_ids) > 1:
+            conn.execute("UPDATE subtitles SET speaker_name='其他/原声', speaker_conf=0.91 WHERE id=?", (sub_ids[1],))
+        conn.execute("UPDATE videos SET voiceprint_status='ok' WHERE bvid='BV1DEMO000001' AND page=1")
+
+    sr_sp = loc_client.get("/api/v1/search", params={"bvid": "BV1DEMO000001", "up_name": "乃琳", "speaker_filter": "true"}).json()
+    assert sr_sp["pagination"]["total"] == 1
+    assert sr_sp["items"][0]["speaker_name"] == "嘉然+乃琳"
+
+    sp_patch = tmp_path / "speakers.json.gz"
+    exp_sp = export_speakers(db, sp_patch)
+    assert exp_sp["parts_exported"] == 1
+    ap_sp = apply_speakers(cloud_db, sp_patch)
+    assert ap_sp["parts_applied"] == 1
+    assert cloud_db.get_video("BV1DEMO000001", 1)["voiceprint_status"] == "ok"
 
 
 def test_asr_backfill_helpers(tmp_path: Path) -> None:

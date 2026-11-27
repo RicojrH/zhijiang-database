@@ -23,7 +23,16 @@ from .metrics import SiteMetricsDB
 from .normalizer import run_corpus_normalization
 from .scene_tagger import run_scene_tagging
 from .search import SearchQuery, SearchService
-from .sync_delta import apply_delta, apply_scene_tags, build_manifest, export_delta, export_scene_tags
+from .sync_delta import (
+    apply_delta,
+    apply_scene_tags,
+    apply_speakers,
+    build_manifest,
+    export_delta,
+    export_scene_tags,
+    export_speakers,
+)
+from .voiceprint import build_voiceprint_bank_from_cache, run_voiceprint_batch
 
 
 def _print_json(data: object) -> None:
@@ -455,6 +464,38 @@ def cmd_apply_scene_tags(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_apply_speakers(args: argparse.Namespace) -> int:
+    cfg = load_config(db_path=args.db)
+    db = CorpusDB(cfg.db_path)
+    res = apply_speakers(db, args.patch_file)
+    _print_json(res)
+    return 0
+
+
+def cmd_build_voiceprint_bank(args: argparse.Namespace) -> int:
+    res = build_voiceprint_bank_from_cache()
+    _print_json(res)
+    return 0
+
+
+def cmd_run_voiceprint(args: argparse.Namespace) -> int:
+    cfg = load_config(db_path=args.db)
+    db = CorpusDB(cfg.db_path)
+    res = run_voiceprint_batch(
+        db,
+        cfg,
+        scope=args.scope,
+        limit=args.limit,
+        shard_index=args.shard_index,
+        shard_total=args.shard_total,
+        num_threads=args.threads,
+        prefetch=args.prefetch,
+        force=args.force,
+    )
+    _print_json(res)
+    return 0
+
+
 def cmd_backfill_metrics(args: argparse.Namespace) -> int:
     cfg = load_config(db_path=args.db)
     metrics_db = SiteMetricsDB(cfg.db_path.parent / "site_metrics.db")
@@ -659,6 +700,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_atags = sub.add_parser("apply-scene-tags", help="在云端热应用纯场景标签轻量补丁（不触碰字幕正文）")
     p_atags.add_argument("patch_file", help="标签补丁路径（.json.gz）")
     p_atags.set_defaults(func=cmd_apply_scene_tags)
+
+    p_aspk = sub.add_parser("apply-speakers", help="在云端热应用纯声纹发言人标注轻量补丁（零 FTS5 重写）")
+    p_aspk.add_argument("patch_file", help="声纹补丁路径（.json.gz）")
+    p_aspk.set_defaults(func=cmd_apply_speakers)
+
+    p_vp_bank = sub.add_parser("build-voiceprint-bank", help="从 2021~2026 跨时期特征缓存编译正式 6 人声纹模型包")
+    p_vp_bank.set_defaults(func=cmd_build_voiceprint_bank)
+
+    p_vp = sub.add_parser("run-voiceprint", help="批量执行声纹发言人标注（默认覆盖多人场与影厅/反应回，支持断点续跑）")
+    p_vp.add_argument(
+        "--scope",
+        default="multi_and_watch",
+        choices=["multi_and_watch", "multi_only", "all"],
+        help="标注范围（默认 multi_and_watch：双播/团播/特别场 + 影厅/电影反应回）",
+    )
+    p_vp.add_argument("--limit", type=int, default=0, help="最多处理分 P 数量（0=全部待标注）")
+    p_vp.add_argument("--threads", type=int, default=4, help="单进程 ONNX 推理线程数（默认 4）")
+    p_vp.add_argument("--prefetch", type=int, default=2, help="后台预取队列深度")
+    p_vp.add_argument("--shard-index", type=int, default=0, help="多进程分片序号")
+    p_vp.add_argument("--shard-total", type=int, default=1, help="多进程分片总数")
+    p_vp.add_argument("--force", action="store_true", help="强制重跑已标注分 P")
+    p_vp.set_defaults(func=cmd_run_voiceprint)
 
     p_bmetrics = sub.add_parser("backfill-metrics", help="从 Nginx access.log* 幂等补回历史真实访问人数（UV/PV）")
     p_bmetrics.add_argument("--log-dir", default="/var/log/nginx", help="Nginx 日志目录（默认 /var/log/nginx）")

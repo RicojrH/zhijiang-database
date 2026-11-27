@@ -26,7 +26,7 @@ from .db import CorpusDB
 from .ingest import ingest_from_up
 from .normalizer import run_corpus_normalization
 from .scene_tagger import run_scene_tagging
-from .sync_delta import export_delta, export_scene_tags
+from .sync_delta import export_delta, export_scene_tags, export_speakers
 
 LogCallback = Callable[[str], None]
 
@@ -701,3 +701,81 @@ def backfill_cloud_metrics(
 
     live = _fetch_public_stats(pub_url)
     return {"mode": "backfill_metrics", "backfill": info, "live_stats": live}
+
+
+def sync_speakers_to_cloud(
+    db: CorpusDB,
+    conf: Dict[str, Any],
+    password: Optional[str],
+    *,
+    also_publish_announcements: bool = True,
+    log_cb: LogCallback,
+) -> Dict[str, Any]:
+    """极速增量同步声纹发言人标注到云端（零 FTS5 重建、不重传字幕文本）."""
+    cloud_host = conf["cloud_host"]
+    app_dir = conf["cloud_app_dir"]
+    pub_url = conf["public_url"]
+
+    TMP_SYNC_DIR.mkdir(parents=True, exist_ok=True)
+    patch_file = TMP_SYNC_DIR / "speakers_patch.json.gz"
+    patch_file.unlink(missing_ok=True)
+
+    log_cb(f"正在连接云端 {cloud_host} 拉取最新代码与远端声纹进度清单...")
+    client = _open_ssh_client(cloud_host, password=password)
+    try:
+        code, out, err = _exec_remote(
+            client,
+            f"set -e; cd {app_dir}; git checkout -- config/announcements.json 2>/dev/null || true; "
+            "git pull --ff-only -q origin main; .venv/bin/python run.py sync-manifest",
+            timeout=120,
+        )
+        if code != 0:
+            raise RuntimeError(f"拉取云端清单失败: {err or out}")
+        remote_manifest = json.loads(out.strip()) if out.strip() else {}
+
+        exp = export_speakers(db, patch_file, remote_manifest=remote_manifest)
+        log_cb(
+            f"已打包增量声纹补丁：{exp['parts_exported']} 个新标注分P / "
+            f"{exp['lines_exported']:,} 条发言人标签 | 补丁体积仅 {exp['patch_size_kb']} KB"
+        )
+
+        sftp = client.open_sftp()
+        try:
+            if also_publish_announcements and ANNOUNCEMENTS_PATH.exists():
+                log_cb("同步本地 config/announcements.json 到云端...")
+                sftp.put(str(ANNOUNCEMENTS_PATH), posixpath.join(app_dir, "config", "announcements.json"))
+
+            apply_info: Dict[str, Any] = {"parts_applied": 0, "lines_updated": 0}
+            if int(exp["parts_exported"]) > 0:
+                log_cb("正在通过 SFTP 上传轻量声纹补丁...")
+                sftp.put(str(patch_file), "/tmp/zhijiang_speakers.json.gz")
+        finally:
+            sftp.close()
+
+        if int(exp["parts_exported"]) > 0:
+            log_cb("正在云端热写入声纹标注（零停服、零 FTS5 重建）...")
+            code, out, err = _exec_remote(
+                client,
+                f"set -e; cd {app_dir}; .venv/bin/python run.py apply-speakers /tmp/zhijiang_speakers.json.gz && rm -f /tmp/zhijiang_speakers.json.gz",
+                timeout=300,
+            )
+            if code != 0:
+                raise RuntimeError(f"云端应用声纹补丁失败: {err or out}")
+            apply_info = json.loads(out.strip())
+            log_cb(
+                f"✅ 云端声纹同步完成：更新 {apply_info.get('parts_applied', 0)} 个分P / "
+                f"{apply_info.get('lines_updated', 0):,} 条发言人标注！"
+            )
+        else:
+            log_cb("✅ 云端声纹标注已与本地完全一致，无需上传。")
+    finally:
+        client.close()
+        patch_file.unlink(missing_ok=True)
+
+    live = _fetch_public_stats(pub_url)
+    return {
+        "mode": "speakers_only",
+        "exported": exp,
+        "applied": apply_info,
+        "live_stats": live,
+    }

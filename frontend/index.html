@@ -17,7 +17,7 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="./styles.css?v=20261127" />
+  <link rel="stylesheet" href="./styles.css?v=20261127b" />
 </head>
 <body>
   <div class="spectrum-bar" aria-hidden="true"></div>
@@ -127,6 +127,11 @@
         <label class="fuzzy-check" title="自动同时匹配同音字与常见别称，例如搜 小海诺 同时命中 小海螺/小螺">
           <input id="fuzzyToggle" type="checkbox" checked />
           <span>同音/别称模糊扩展</span>
+        </label>
+
+        <label class="fuzzy-check" title="按声纹识别出的实际发言人跨频道精准筛选，并自动过滤电影/动画/游戏原声">
+          <input id="speakerFilterToggle" type="checkbox" />
+          <span>按声纹发言人筛选</span>
         </label>
       </div>
     </section>
@@ -241,7 +246,7 @@
     </div>
   </div>
 
-  <script src="./config.js?v=20261127"></script>
-  <script src="./app.js?v=20261127"></script>
+  <script src="./config.js?v=20261127b"></script>
+  <script src="./app.js?v=20261127b"></script>
 </body>
 </html>
