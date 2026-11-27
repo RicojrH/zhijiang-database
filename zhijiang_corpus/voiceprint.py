@@ -24,7 +24,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # 云端轻量检索环境无 numpy，仅在真正执行声纹推理/建库时需要
+    np = None  # type: ignore[assignment]
 
 from .asr_backfill import convert_to_16k_wav, register_windows_cuda_dlls
 from .bilibili_client import BilibiliClient

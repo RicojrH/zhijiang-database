@@ -12,8 +12,6 @@ from typing import List, Optional
 import qrcode
 import uvicorn
 
-from .api import create_app
-from .asr_backfill import resplit_legacy_asr, run_asr_backfill
 from .bilibili_client import BilibiliClient
 from .clip_planner import plan_clip_job
 from .config import VALID_SCENE_TYPES, load_config, save_cookie_to_env
@@ -32,7 +30,6 @@ from .sync_delta import (
     export_scene_tags,
     export_speakers,
 )
-from .voiceprint import build_voiceprint_bank_from_cache, run_voiceprint_batch
 
 
 def _print_json(data: object) -> None:
@@ -234,6 +231,8 @@ def cmd_normalize_corpus(args: argparse.Namespace) -> int:
 
 
 def cmd_backfill_asr(args: argparse.Namespace) -> int:
+    from .asr_backfill import run_asr_backfill
+
     cfg = load_config(db_path=args.db, cookie=args.cookie)
     db = CorpusDB(cfg.db_path)
     eff_limit = None if args.limit == 0 else args.limit
@@ -273,6 +272,8 @@ def cmd_backfill_asr(args: argparse.Namespace) -> int:
 
 
 def cmd_resplit_asr(args: argparse.Namespace) -> int:
+    from .asr_backfill import resplit_legacy_asr
+
     cfg = load_config(db_path=args.db)
     db = CorpusDB(cfg.db_path)
     res = resplit_legacy_asr(
@@ -473,12 +474,16 @@ def cmd_apply_speakers(args: argparse.Namespace) -> int:
 
 
 def cmd_build_voiceprint_bank(args: argparse.Namespace) -> int:
+    from .voiceprint import build_voiceprint_bank_from_cache
+
     res = build_voiceprint_bank_from_cache()
     _print_json(res)
     return 0
 
 
 def cmd_run_voiceprint(args: argparse.Namespace) -> int:
+    from .voiceprint import run_voiceprint_batch
+
     cfg = load_config(db_path=args.db)
     db = CorpusDB(cfg.db_path)
     res = run_voiceprint_batch(
@@ -507,6 +512,8 @@ def cmd_backfill_metrics(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    from .api import create_app
+
     cfg = load_config(db_path=args.db)
     enable_admin = not args.public_only
     app = create_app(db_path=cfg.db_path, enable_admin=enable_admin)

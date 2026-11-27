@@ -24,7 +24,6 @@ from fastapi.staticfiles import StaticFiles
 from zhijiang_corpus.config import PROJECT_ROOT, load_config
 from zhijiang_corpus.db import CorpusDB
 
-from .routers.admin import build_admin_router
 from .routers.public import build_public_router
 
 DEBUG_CONSOLE_PATH = Path(__file__).resolve().parent / "debug_console.html"
@@ -75,8 +74,10 @@ def create_app(
     # 1. 公网只读检索 API（始终挂载）
     app.include_router(build_public_router(db, cfg))
 
-    # 2. 本地私有管理 API 与运维调试台（仅本地模式挂载，云端部署默认彻底关闭）
+    # 2. 本地私有管理 API 与运维调试台（仅本地模式挂载，云端部署默认彻底关闭且不加载 admin 依赖）
     if enable_admin:
+        from .routers.admin import build_admin_router
+
         app.include_router(build_admin_router(db))
 
         @app.get("/debug", response_class=HTMLResponse, include_in_schema=False)
@@ -125,10 +126,21 @@ def create_app(
     return app
 
 
-# 供 Uvicorn 直接加载的两种明确实例：
+# 供 Uvicorn 按需懒加载的三种明确实例（避免云端加载 public_app 时触发 local_app/admin 依赖）：
 # - backend.app:public_app -> 云端生产只读后端（推荐上云使用）
 # - backend.app:local_app  -> 本地含运维与调试台的完整实例
 # - backend.app:app        -> 按环境变量 ZJ_ENABLE_ADMIN 自动切换
-public_app = create_app(enable_admin=False)
-local_app = create_app(enable_admin=True)
-app = create_app()
+def __getattr__(name: str) -> FastAPI:
+    if name == "public_app":
+        inst = create_app(enable_admin=False)
+        globals()[name] = inst
+        return inst
+    if name == "local_app":
+        inst = create_app(enable_admin=True)
+        globals()[name] = inst
+        return inst
+    if name == "app":
+        inst = create_app()
+        globals()[name] = inst
+        return inst
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

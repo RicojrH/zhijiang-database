@@ -35,7 +35,6 @@ from zhijiang_corpus.cloud_ops import (
     sync_scene_tags_to_cloud,
     sync_speakers_to_cloud,
 )
-from zhijiang_corpus.voiceprint import get_voiceprint_progress
 from zhijiang_corpus.config import PROJECT_ROOT, VALID_SCENE_TYPES, load_config, save_cookie_to_env
 from zhijiang_corpus.db import CorpusDB
 from zhijiang_corpus.ingest import ingest_bvids, ingest_from_up
@@ -673,6 +672,8 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
 
     @router.get("/voiceprint/status", summary="查看声纹发言人标注实时进度与日志")
     def api_voiceprint_status() -> Dict[str, Any]:
+        from zhijiang_corpus.voiceprint import get_voiceprint_progress
+
         progress = get_voiceprint_progress(db)
         with vp_lock:
             alive = [p for p in vp_procs if p.poll() is None]
