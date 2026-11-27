@@ -56,6 +56,33 @@ class SubtitleRow:
     source: str = "bilibili_ai"
 
 
+VALID_SPEAKER_ATOMS = ("嘉然", "贝拉", "乃琳", "向晚", "心宜", "思诺", "其他")
+
+
+def normalize_speaker_label(raw: str) -> str:
+    """校验并规整人工或声纹发言人标签（允许空串清空、单成员、其他、或 A+B 组合）."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    # 允许用 + / 、 , 空格 分隔多人组合，统一规整为 '+' 连接
+    import re
+
+    parts = [p.strip() for p in re.split(r"[+/、,，\s]+", text) if p.strip()]
+    if not parts:
+        return ""
+    dedup: List[str] = []
+    for p in parts:
+        if p not in VALID_SPEAKER_ATOMS:
+            raise ValueError(
+                f"无效发言人标签 {p!r}，可选值：{', '.join(VALID_SPEAKER_ATOMS)}（支持 + 组合，如 嘉然+贝拉，留空表示清空）"
+            )
+        if p not in dedup:
+            dedup.append(p)
+    if "其他" in dedup and len(dedup) > 1:
+        raise ValueError("「其他」不可与成员名同时组合")
+    return "+".join(dedup)
+
+
 class CorpusDB:
     """SQLite 语料库访问层（保持纯标准 SQL，便于后续抽象为 PostgreSQL 适配层）."""
 
@@ -420,6 +447,129 @@ class CorpusDB:
                     (val, bvid, page),
                 )
             return cur.rowcount
+
+    def update_subtitle_speaker(
+        self,
+        subtitle_id: int,
+        speaker_name: str,
+        *,
+        confidence: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        """人工修正单条字幕的发言人标签，并更新所属分 P 的 updated_at 以便极速热同步上云."""
+        cleaned = normalize_speaker_label(speaker_name)
+        conf = float(confidence) if cleaned else 0.0
+        with self.session() as conn:
+            row = conn.execute(
+                "SELECT id, bvid, page, speaker_name FROM subtitles WHERE id = ?",
+                (int(subtitle_id),),
+            ).fetchone()
+            if not row:
+                return None
+            bvid = str(row["bvid"])
+            page = int(row["page"])
+            conn.execute(
+                "UPDATE subtitles SET speaker_name = ?, speaker_conf = ? WHERE id = ?",
+                (cleaned, conf, int(subtitle_id)),
+            )
+            conn.execute(
+                """
+                UPDATE videos
+                   SET voiceprint_status = CASE WHEN ? != '' OR voiceprint_status = 'ok' THEN 'ok' ELSE voiceprint_status END,
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE bvid = ? AND page = ?
+                """,
+                (cleaned, bvid, page),
+            )
+        return {
+            "id": int(subtitle_id),
+            "bvid": bvid,
+            "page": page,
+            "old_speaker": str(row["speaker_name"] or ""),
+            "speaker_name": cleaned,
+            "speaker_conf": conf,
+        }
+
+    def batch_update_video_speakers(
+        self,
+        bvid: str,
+        page: Optional[int],
+        speaker_name: str,
+        *,
+        from_speaker: Optional[str] = None,
+        start_sec: Optional[float] = None,
+        end_sec: Optional[float] = None,
+        confidence: float = 1.0,
+    ) -> Dict[str, Any]:
+        """按场次/分P（可选时间段与原发言人条件）批量修正字幕发言人标签."""
+        cleaned = normalize_speaker_label(speaker_name)
+        conf = float(confidence) if cleaned else 0.0
+
+        where_parts = ["bvid = ?"]
+        params: List[Any] = [bvid]
+        if page is not None:
+            where_parts.append("page = ?")
+            params.append(int(page))
+        if start_sec is not None:
+            where_parts.append("start_sec >= ?")
+            params.append(float(start_sec))
+        if end_sec is not None:
+            where_parts.append("start_sec <= ?")
+            params.append(float(end_sec))
+        if from_speaker is not None and from_speaker != "__ALL__":
+            if from_speaker == "__EMPTY__":
+                where_parts.append("speaker_name = ''")
+            else:
+                where_parts.append("speaker_name = ?")
+                params.append(normalize_speaker_label(from_speaker))
+
+        where_sql = " AND ".join(where_parts)
+        with self.session() as conn:
+            if page is None:
+                vrows = conn.execute(
+                    "SELECT page FROM videos WHERE bvid = ?", (bvid,)
+                ).fetchall()
+            else:
+                vrows = conn.execute(
+                    "SELECT page FROM videos WHERE bvid = ? AND page = ?",
+                    (bvid, int(page)),
+                ).fetchall()
+            if not vrows:
+                return {"found": False, "affected_rows": 0, "speaker_name": cleaned}
+
+            cur = conn.execute(
+                f"UPDATE subtitles SET speaker_name = ?, speaker_conf = ? WHERE {where_sql}",
+                [cleaned, conf, *params],
+            )
+            affected = max(0, int(cur.rowcount or 0))
+            if affected > 0:
+                if page is None:
+                    conn.execute(
+                        """
+                        UPDATE videos
+                           SET voiceprint_status = CASE WHEN ? != '' OR voiceprint_status = 'ok' THEN 'ok' ELSE voiceprint_status END,
+                               updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                         WHERE bvid = ?
+                        """,
+                        (cleaned, bvid),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE videos
+                           SET voiceprint_status = CASE WHEN ? != '' OR voiceprint_status = 'ok' THEN 'ok' ELSE voiceprint_status END,
+                               updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                         WHERE bvid = ? AND page = ?
+                        """,
+                        (cleaned, bvid, int(page)),
+                    )
+        return {
+            "found": True,
+            "bvid": bvid,
+            "page": page,
+            "affected_rows": affected,
+            "speaker_name": cleaned,
+            "speaker_conf": conf,
+        }
 
     def get_stats(self) -> Dict[str, Any]:
         with self.session() as conn:

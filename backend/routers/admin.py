@@ -53,6 +53,27 @@ class ScenePatchRequest(BaseModel):
     is_visible: Optional[int] = Field(default=None, description="1=可见，0=隐藏")
 
 
+class SubtitleSpeakerPatchRequest(BaseModel):
+    speaker_name: str = Field(
+        default="",
+        description="新发言人标签（嘉然/贝拉/乃琳/向晚/心宜/思诺/其他，支持 + 组合如 嘉然+贝拉，空串表示清空/默认）",
+    )
+
+
+class VideoSpeakersBatchPatchRequest(BaseModel):
+    page: Optional[int] = Field(default=None, description="为空则更新该 BV 号全部分 P")
+    speaker_name: str = Field(
+        default="",
+        description="目标发言人标签（嘉然/贝拉/乃琳/向晚/心宜/思诺/其他，支持 + 组合，空串表示清空）",
+    )
+    from_speaker: Optional[str] = Field(
+        default="__ALL__",
+        description="可选过滤：__ALL__=全部行，__EMPTY__=仅未标注行，或指定要替换的原发言人标签",
+    )
+    start_sec: Optional[float] = Field(default=None, ge=0.0, description="可选起始秒数（含）")
+    end_sec: Optional[float] = Field(default=None, ge=0.0, description="可选结束秒数（含）")
+
+
 class CookieSaveRequest(BaseModel):
     cookie: str = Field(min_length=1, description="B 站 Cookie 字符串或单独的 SESSDATA 值")
 
@@ -342,6 +363,40 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
         if updated == 0:
             raise HTTPException(status_code=404, detail=f"未找到视频记录: {bvid}")
         return {"status": "ok", "bvid": bvid, "page": body.page, "affected_rows": updated}
+
+    @router.patch("/subtitles/{subtitle_id}/speaker", summary="人工修正单条字幕的发言人标签")
+    def patch_subtitle_speaker(subtitle_id: int, body: SubtitleSpeakerPatchRequest) -> Dict[str, Any]:
+        try:
+            res = db.update_subtitle_speaker(subtitle_id, body.speaker_name, confidence=1.0)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if res is None:
+            raise HTTPException(status_code=404, detail=f"未找到字幕记录: {subtitle_id}")
+        return {"status": "ok", **res}
+
+    @router.patch("/videos/{bvid}/speakers", summary="按场次/分P/时间段批量修正发言人标签")
+    def patch_video_speakers(bvid: str, body: VideoSpeakersBatchPatchRequest) -> Dict[str, Any]:
+        if (
+            body.start_sec is not None
+            and body.end_sec is not None
+            and body.start_sec > body.end_sec
+        ):
+            raise HTTPException(status_code=400, detail="起始秒数不能大于结束秒数")
+        try:
+            res = db.batch_update_video_speakers(
+                bvid,
+                body.page,
+                body.speaker_name,
+                from_speaker=body.from_speaker,
+                start_sec=body.start_sec,
+                end_sec=body.end_sec,
+                confidence=1.0,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not res.get("found"):
+            raise HTTPException(status_code=404, detail=f"未找到视频记录: {bvid}")
+        return {"status": "ok", **res}
 
     @router.post("/db/optimize", summary="大批量抓取后优化 FTS5 索引与回收 WAL")
     def optimize_db() -> Dict[str, Any]:

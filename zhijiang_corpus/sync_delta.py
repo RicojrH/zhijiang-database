@@ -459,7 +459,7 @@ def export_speakers(
     with db.session() as conn:
         parts = conn.execute(
             """
-            SELECT bvid, page
+            SELECT bvid, page, updated_at
               FROM videos
              WHERE voiceprint_status = 'ok'
              ORDER BY bvid ASC, page ASC
@@ -471,9 +471,14 @@ def export_speakers(
         for p in parts:
             bvid = str(p["bvid"])
             page = int(p["page"])
+            local_upd = str(p["updated_at"] or "")
             if remote_manifest is not None:
                 rem = remote_manifest.get(_part_key(bvid, page))
-                if rem and str(rem.get("voiceprint_status") or "") == "ok":
+                if (
+                    rem
+                    and str(rem.get("voiceprint_status") or "") == "ok"
+                    and local_upd <= str(rem.get("updated_at") or "")
+                ):
                     continue
             srows = conn.execute(
                 """
@@ -494,7 +499,15 @@ def export_speakers(
                 for r in srows
             ]
             lines_total += len(compact)
-            payload_parts.append({"bvid": bvid, "page": page, "rows": compact})
+            payload_parts.append(
+                {
+                    "bvid": bvid,
+                    "page": page,
+                    "updated_at": local_upd,
+                    "reset_first": True,
+                    "rows": compact,
+                }
+            )
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -538,6 +551,12 @@ def apply_speakers(db: CorpusDB, patch_path: str | Path) -> Dict[str, Any]:
                 bvid = str(item["bvid"])
                 page = int(item["page"])
                 rows = item.get("rows") or []
+                part_upd = str(item.get("updated_at") or "")
+                if item.get("reset_first"):
+                    conn.execute(
+                        "UPDATE subtitles SET speaker_name = '', speaker_conf = 0.0 WHERE bvid = ? AND page = ?",
+                        (bvid, page),
+                    )
                 if rows:
                     conn.executemany(
                         """
@@ -555,10 +574,10 @@ def apply_speakers(db: CorpusDB, patch_path: str | Path) -> Dict[str, Any]:
                     """
                     UPDATE videos
                        SET voiceprint_status = 'ok',
-                           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                           updated_at = CASE WHEN ? != '' THEN ? ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END
                      WHERE bvid = ? AND page = ?
                     """,
-                    (bvid, page),
+                    (part_upd, part_upd, bvid, page),
                 )
                 parts_applied += 1
 

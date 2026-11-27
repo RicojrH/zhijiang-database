@@ -120,6 +120,26 @@
     .qr-wrap img { width: 168px; height: 168px; border: 1px solid var(--border); border-radius: 8px; padding: 6px; background: #fff; }
     .hidden { display: none !important; }
     .empty { text-align: center; padding: 36px 16px; color: var(--muted); }
+    .sp-sel {
+      padding: 2px 6px; border: 1px solid #d1d5db; border-radius: 5px;
+      font-size: 12px; background: #fff; color: var(--text); cursor: pointer;
+    }
+    .sp-sel.saved { border-color: var(--ok); background: var(--ok-soft); }
+    .sp-saved-tip { font-size: 11.5px; color: var(--ok); font-weight: 600; }
+    .modal-mask {
+      position: fixed; inset: 0; background: rgba(15, 23, 42, 0.48);
+      display: flex; align-items: center; justify-content: center; z-index: 60; padding: 16px;
+    }
+    .modal-card {
+      background: var(--surface); border-radius: 12px; border: 1px solid var(--border);
+      width: 100%; max-width: 520px; padding: 20px; box-shadow: 0 20px 50px rgba(0,0,0,0.22);
+    }
+    .modal-card h3 { margin: 0 0 8px; font-size: 16px; }
+    .modal-field { margin-top: 12px; font-size: 13px; color: var(--text); }
+    .modal-field label { display: block; color: var(--muted); margin-bottom: 4px; }
+    .modal-field input, .modal-field select {
+      width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px;
+    }
   </style>
 </head>
 <body>
@@ -504,6 +524,62 @@
   </section>
 </main>
 
+<div id="speakerBatchModal" class="modal-mask hidden" onclick="if(event.target===this) closeSpeakerModal()">
+  <div class="modal-card">
+    <h3>批量修改发言人标签</h3>
+    <div id="spModalInfo" style="font-size:12.5px;color:var(--muted);line-height:1.5;"></div>
+    <input type="hidden" id="spModalBvid" />
+    <input type="hidden" id="spModalPage" />
+    <div class="modal-field">
+      <label>过滤条件：仅替换原发言人标签（默认替换范围内全部行）</label>
+      <select id="spModalFrom">
+        <option value="__ALL__">全部行（不限原标签）</option>
+        <option value="__EMPTY__">仅未标注行（原标签为空）</option>
+        <option value="嘉然">仅原标签 = 嘉然</option>
+        <option value="贝拉">仅原标签 = 贝拉</option>
+        <option value="乃琳">仅原标签 = 乃琳</option>
+        <option value="向晚">仅原标签 = 向晚</option>
+        <option value="心宜">仅原标签 = 心宜</option>
+        <option value="思诺">仅原标签 = 思诺</option>
+        <option value="其他">仅原标签 = 其他</option>
+      </select>
+    </div>
+    <div class="modal-field" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+      <div>
+        <label>起始秒数（选填，留空从头开始）</label>
+        <input id="spModalStart" type="number" step="0.1" min="0" placeholder="例如 120" />
+      </div>
+      <div>
+        <label>结束秒数（选填，留空至结尾）</label>
+        <input id="spModalEnd" type="number" step="0.1" min="0" placeholder="例如 600" />
+      </div>
+    </div>
+    <div class="modal-field">
+      <label>目标发言人标签（单人、其他、清空，或下方输入多人组合如 嘉然+贝拉）</label>
+      <select id="spModalTarget" onchange="document.getElementById('spModalCustom').value = this.value === '__CUSTOM__' ? '' : this.value">
+        <option value="">清空（恢复未标注/单播默认）</option>
+        <option value="嘉然">嘉然</option>
+        <option value="贝拉">贝拉</option>
+        <option value="乃琳">乃琳</option>
+        <option value="向晚">向晚</option>
+        <option value="心宜">心宜</option>
+        <option value="思诺">思诺</option>
+        <option value="其他">其他（电影/游戏原声）</option>
+        <option value="__CUSTOM__">自定义多人组合（在下方输入）</option>
+      </select>
+    </div>
+    <div class="modal-field">
+      <label>最终写入值（可直接编辑，如 嘉然+贝拉；留空表示清空）</label>
+      <input id="spModalCustom" type="text" placeholder="留空=清空；单人填名字；多人用 + 连接如 嘉然+贝拉" />
+    </div>
+    <div id="spModalMsg" style="margin-top:10px;font-size:12.5px;min-height:18px;"></div>
+    <div style="margin-top:14px;display:flex;justify-content:flex-end;gap:8px;">
+      <button class="btn sec" onclick="closeSpeakerModal()">取消</button>
+      <button class="btn" id="spModalSubmitBtn" onclick="submitBatchSpeakers()">确认批量修改</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let selectedUps = new Set();
 let selectedSpeakers = new Set();
@@ -530,7 +606,7 @@ function hasQuery() {
 }
 
 function esc(s) {
-  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function highlight(text, q, expandedMap) {
@@ -701,11 +777,22 @@ async function runSearch(page) {
     return;
   }
 
+  const SPEAKER_OPTS = ['', '嘉然', '贝拉', '乃琳', '向晚', '心宜', '思诺', '其他'];
+  window._renderSpeakerSelect = function(subId, currentSp) {
+    const sp = currentSp || '';
+    const hasCustom = sp && !SPEAKER_OPTS.includes(sp);
+    const opts = SPEAKER_OPTS.map(o => `<option value="${esc(o)}" ${sp === o ? 'selected' : ''}>${o ? esc(o) : '未标注(默认)'}</option>`).join('')
+      + (hasCustom ? `<option value="${esc(sp)}" selected>${esc(sp)}</option>` : '')
+      + `<option value="__CUSTOM__">自定义组合(如 嘉然+贝拉)…</option>`;
+    return `<select class="sp-sel" data-prev="${esc(sp)}" onchange="patchSubtitleSpeaker(${subId}, this)" title="修改本行发言人标签">${opts}</select><span class="sp-saved-tip"></span>`;
+  };
+
   box.innerHTML = data.items.map(it => `
     <div class="card" id="card-${it.id}">
       <div class="card-meta">
         <span class="badge up">${esc(it.up_name)}</span>
         <span class="badge scene">${esc(it.scene_type)}</span>
+        <span style="display:inline-flex;align-items:center;gap:4px;">发言人：${window._renderSpeakerSelect(it.id, it.speaker_name)}</span>
         <span class="badge time">${esc(it.start_hms)} ~ ${esc(it.end_hms)}</span>
         <span>(${it.start_sec.toFixed(2)}s - ${it.end_sec.toFixed(2)}s)</span>
         <span>${esc(it.pub_date)}</span>
@@ -725,6 +812,44 @@ async function runSearch(page) {
   `).join('');
 }
 
+async function patchSubtitleSpeaker(subId, selEl) {
+  let val = selEl.value;
+  const prev = selEl.dataset.prev || '';
+  if (val === '__CUSTOM__') {
+    const input = prompt('请输入发言人标签（单人/其他，或多人用 + 连接如 嘉然+贝拉；留空表示清空）：', prev);
+    if (input === null) {
+      selEl.value = prev;
+      return;
+    }
+    val = input.trim();
+  }
+  const tip = selEl.nextElementSibling;
+  if (tip) tip.textContent = '保存中...';
+  const res = await fetch(`/api/v1/admin/subtitles/${subId}/speaker`, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ speaker_name: val })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    alert(data.detail || '修改发言人失败');
+    selEl.value = prev;
+    if (tip) tip.textContent = '';
+    return;
+  }
+  const saved = data.speaker_name || '';
+  if (saved && !Array.from(selEl.options).some(o => o.value === saved)) {
+    const opt = document.createElement('option');
+    opt.value = saved;
+    opt.textContent = saved;
+    selEl.insertBefore(opt, selEl.options[selEl.options.length - 1]);
+  }
+  selEl.value = saved;
+  selEl.dataset.prev = saved;
+  selEl.classList.add('saved');
+  if (tip) tip.textContent = '✓ 已存';
+}
+
 function changePage(dir) { runSearch(Math.max(0, currentOffset + dir * pageLimit)); }
 
 async function toggleContext(subId, bvid, page, startSec) {
@@ -736,8 +861,9 @@ async function toggleContext(subId, bvid, page, startSec) {
   const data = await r.json();
   if (!data.items.length) { el.textContent = '暂无上下文数据'; return; }
   el.innerHTML = data.items.map(x => `
-    <div class="ctx-line ${x.id === subId ? 'hit' : ''}">
+    <div class="ctx-line ${x.id === subId ? 'hit' : ''}" style="align-items:center;">
       <span class="ctx-ts">${x.start_sec.toFixed(2)}s</span>
+      <span style="display:inline-flex;align-items:center;gap:4px;min-width:136px;">${window._renderSpeakerSelect(x.id, x.speaker_name)}</span>
       <span>${esc(x.content)}</span>
     </div>
   `).join('');
@@ -801,10 +927,68 @@ async function loadVideos(page) {
             ${['unknown','solo','duo','group','special'].map(opt => `<option value="${opt}" ${v.scene_type===opt?'selected':''}>${opt}</option>`).join('')}
           </select>${lockTag}
         </td>
-        <td><button class="link-btn" onclick="searchByBvid('${esc(v.bvid)}')">搜本场</button></td>
+        <td style="white-space:nowrap;">
+          <button class="link-btn" onclick="searchByBvid('${esc(v.bvid)}')">搜本场</button>
+          <button class="link-btn" onclick="openSpeakerModal('${esc(v.bvid)}', ${v.page}, '${esc(v.up_name)}', '${esc(v.title)}')">改发言人</button>
+        </td>
       </tr>
     `;
   }).join('');
+}
+
+function openSpeakerModal(bvid, page, upName, title) {
+  document.getElementById('spModalBvid').value = bvid;
+  document.getElementById('spModalPage').value = page;
+  document.getElementById('spModalInfo').innerHTML = `目标场次：<b>${esc(bvid)} P${page}</b>（${esc(upName)}直播间）<br>${esc(title)}`;
+  document.getElementById('spModalFrom').value = '__ALL__';
+  document.getElementById('spModalStart').value = '';
+  document.getElementById('spModalEnd').value = '';
+  document.getElementById('spModalTarget').value = upName || '';
+  document.getElementById('spModalCustom').value = upName || '';
+  document.getElementById('spModalMsg').textContent = '';
+  document.getElementById('speakerBatchModal').classList.remove('hidden');
+}
+
+function closeSpeakerModal() {
+  document.getElementById('speakerBatchModal').classList.add('hidden');
+}
+
+async function submitBatchSpeakers() {
+  const bvid = document.getElementById('spModalBvid').value;
+  const page = parseInt(document.getElementById('spModalPage').value || '1', 10);
+  const fromSp = document.getElementById('spModalFrom').value;
+  const startRaw = document.getElementById('spModalStart').value.trim();
+  const endRaw = document.getElementById('spModalEnd').value.trim();
+  const speakerName = document.getElementById('spModalCustom').value.trim();
+  const msgEl = document.getElementById('spModalMsg');
+  const btn = document.getElementById('spModalSubmitBtn');
+  btn.disabled = true;
+  msgEl.style.color = 'var(--muted)';
+  msgEl.textContent = '正在批量写入发言人标签...';
+  try {
+    const body = {
+      page,
+      speaker_name: speakerName,
+      from_speaker: fromSp,
+      start_sec: startRaw === '' ? null : parseFloat(startRaw),
+      end_sec: endRaw === '' ? null : parseFloat(endRaw),
+    };
+    const r = await fetch(`/api/v1/admin/videos/${encodeURIComponent(bvid)}/speakers`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      msgEl.style.color = '#dc2626';
+      msgEl.textContent = '❌ ' + (data.detail || '修改失败');
+      return;
+    }
+    msgEl.style.color = 'var(--ok)';
+    msgEl.textContent = `✅ 已更新 ${data.affected_rows} 条字幕发言人为「${data.speaker_name || '未标注(默认)'}」（可到云端同步页点「仅同步声纹标注结果」零停服热同步到线上）`;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function searchByBvid(bvid) {
