@@ -380,6 +380,38 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     sr2 = loc_client.get("/api/v1/search", params={"q": "小作文", "scene_type": "special"}).json()
     assert any(it["bvid"] == "BV1DEMO000001" for it in sr2["items"])
 
+    # 校验【突击】单播优先规则（排除双人/多人联机突击）
+    from zhijiang_corpus.scene_tagger import classify_video_scene
+
+    tuji_solo = classify_video_scene(
+        {
+            "bvid": "BV1TUJI00001",
+            "page": 1,
+            "up_name": "嘉然",
+            "title": "【直播回放】【突击】一起看叶问2！ 2026年09月05日22点场",
+            "part_title": "",
+            "scene_type": "unknown",
+            "extra_meta": "{}",
+        },
+        [(10.0, "贝拉和乃琳上次说的这个电影真好看"), (700.0, "贝拉乃琳")],
+        cfg.members,
+    )
+    assert tuji_solo.new_scene_type == "solo"
+    tuji_duo = classify_video_scene(
+        {
+            "bvid": "BV1TUJI00002",
+            "page": 1,
+            "up_name": "乃琳",
+            "title": "【直播回放】【突击】和然比一起生化9！ 2026年03月10日18点场",
+            "part_title": "",
+            "scene_type": "unknown",
+            "extra_meta": "{}",
+        },
+        [(10.0, "然比快来")],
+        cfg.members,
+    )
+    assert tuji_duo.new_scene_type == "duo"
+
     hit_id = sr["items"][0]["id"]
     plan = loc_client.post("/api/v1/admin/clips/plan", json={"subtitle_ids": [hit_id]}).json()
     assert plan["segment_count"] == 1

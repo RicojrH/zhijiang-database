@@ -53,6 +53,7 @@ DUO_TITLE_KEYWORDS = (
     "双播",
     "双人",
     "双排",
+    "双影",
     "小心思",
     "双人茶话会",
     "双人合唱",
@@ -66,6 +67,26 @@ COLLAB_TITLE_KEYWORDS = (
     "做客",
     "串门",
     "合作直播",
+)
+
+_TUJI_TAG_RE = re.compile(r"【[^】]*突击[^】]*】")
+_TUJI_MULTI_HINTS = (
+    "双播",
+    "双人",
+    "双排",
+    "双影",
+    "小心思",
+    "二人",
+    "团播",
+    "团综",
+    "全员",
+    "联动",
+    "连麦",
+    "琳嘉",
+    "一起玩游戏",
+    "高人高人",
+    "小黄诺和小粉宜",
+    "亚当重锤",
 )
 
 # 字幕正文多人互动特征词（区分“单播顺嘴提一句队友”与“真的在现场互动”）
@@ -231,11 +252,18 @@ def classify_video_scene(
     # 合并识别到的其他成员集合
     detected_others = sorted(set(title_other_members) | set(active_sub_members))
 
-    # 3) 综合决策（优先级：特别场次 > 团播 > 双播/联动 > 单播/未知；已合并 collab 至 duo/group）
+    # 3) 综合决策（优先级：单人【突击】优先判定 > 特别场次 > 团播 > 双播/联动 > 单播/未知）
     new_scene = "unknown"
     confidence = 0.3
 
-    if special_hits:
+    is_tuji_title = bool(_TUJI_TAG_RE.search(title))
+    tuji_multi_hits = _match_keywords(f"{title} {part_title}", _TUJI_MULTI_HINTS)
+
+    if is_tuji_title and not title_other_members and not tuji_multi_hits:
+        new_scene = "solo"
+        confidence = 0.90
+        reasons.append("标题含【突击】且未标注双人/多人联机，归为单播")
+    elif special_hits:
         new_scene = "special"
         confidence = 0.90
     elif group_hits or len(detected_others) >= 2:
