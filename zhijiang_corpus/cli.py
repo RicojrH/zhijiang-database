@@ -488,6 +488,8 @@ def cmd_run_voiceprint(args: argparse.Namespace) -> int:
         limit=args.limit,
         shard_index=args.shard_index,
         shard_total=args.shard_total,
+        device=args.device,
+        batch_size=args.batch_size,
         num_threads=args.threads,
         prefetch=args.prefetch,
         force=args.force,
@@ -708,7 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_vp_bank = sub.add_parser("build-voiceprint-bank", help="从 2021~2026 跨时期特征缓存编译正式 6 人声纹模型包")
     p_vp_bank.set_defaults(func=cmd_build_voiceprint_bank)
 
-    p_vp = sub.add_parser("run-voiceprint", help="批量执行声纹发言人标注（默认覆盖多人场与影厅/反应回，支持断点续跑）")
+    p_vp = sub.add_parser("run-voiceprint", help="批量执行声纹发言人标注（默认优先 CUDA GPU 批量推理，支持断点续跑）")
     p_vp.add_argument(
         "--scope",
         default="multi_and_watch",
@@ -716,8 +718,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="标注范围（默认 multi_and_watch：双播/团播/特别场 + 影厅/电影反应回）",
     )
     p_vp.add_argument("--limit", type=int, default=0, help="最多处理分 P 数量（0=全部待标注）")
-    p_vp.add_argument("--threads", type=int, default=4, help="单进程 ONNX 推理线程数（默认 4）")
-    p_vp.add_argument("--prefetch", type=int, default=2, help="后台预取队列深度")
+    p_vp.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="推理设备（默认 auto：自动优先 CUDA GPU，不可用时回退 CPU）",
+    )
+    p_vp.add_argument("--batch-size", type=int, default=64, help="GPU 批量推理 Batch Size（默认 64）")
+    p_vp.add_argument("--threads", type=int, default=4, help="CPU 回退模式下的单进程 ONNX 线程数（默认 4）")
+    p_vp.add_argument("--prefetch", type=int, default=3, help="后台并发下载+FFmpeg 转码线程数（默认 3）")
     p_vp.add_argument("--shard-index", type=int, default=0, help="多进程分片序号")
     p_vp.add_argument("--shard-total", type=int, default=1, help="多进程分片总数")
     p_vp.add_argument("--force", action="store_true", help="强制重跑已标注分 P")

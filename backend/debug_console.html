@@ -468,15 +468,22 @@
             <option value="all">全库全部场次</option>
           </select>
         </label>
-        <label>并行进程：
-          <select id="vpProcs">
-            <option value="1">1 进程</option>
-            <option value="2" selected>2 进程（推荐）</option>
-            <option value="3">3 进程（高配 CPU）</option>
+        <label>加速设备：
+          <select id="vpDevice">
+            <option value="auto" selected>自动优先 CUDA GPU（推荐，提速 50x+）</option>
+            <option value="cuda">强制 CUDA GPU</option>
+            <option value="cpu">纯 CPU 模式</option>
           </select>
         </label>
-        <label>每进程线程：
-          <input id="vpThreads" type="number" value="4" min="1" max="8" style="width:62px;" />
+        <label>GPU Batch：
+          <input id="vpBatch" type="number" value="64" min="8" max="256" style="width:62px;" />
+        </label>
+        <label>并行进程：
+          <select id="vpProcs">
+            <option value="1" selected>1 进程 + 3路并发拉流（GPU 推荐，省显存）</option>
+            <option value="2">2 进程 + 4路并发拉流（极限全速）</option>
+            <option value="3">3 进程（高配）</option>
+          </select>
         </label>
         <button class="btn" onclick="startVpJob()">启动声纹标注（断点续跑）</button>
         <button class="btn sec" style="color:#dc2626;border-color:#fca5a5;" onclick="stopVpJob()">安全停止声纹任务</button>
@@ -1150,9 +1157,12 @@ async function pollVpStatus() {
   const readyTag = p.model_ready
     ? '<span style="color:var(--ok);font-weight:600;">模型就绪</span>'
     : '<span style="color:var(--warn);font-weight:600;">缺少声纹模型</span>';
+  const gpuTag = p.cuda_available
+    ? '<span style="color:#059669;font-weight:600;">⚡ CUDA GPU 加速就绪</span>'
+    : '<span style="color:var(--muted);">CPU 模式</span>';
   document.getElementById('vpProgressBox').innerHTML = `
     <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
-      <span>状态：${readyTag}</span>
+      <span>状态：${readyTag} · ${gpuTag}</span>
       <span>目标进度：<b>${p.done_parts || 0} / ${p.targets_total || 0}</b> 个分P（<b>${p.pct_parts || 0}%</b>，剩 ${p.remaining_hours || 0} 小时）</span>
       <span>已标注字幕：<b>${(p.all_done_lines || 0).toLocaleString()}</b> 条</span>
       <span>后台任务：<b>${j.running ? '运行中 (' + esc(j.scope) + ')' : '空闲'}</b></span>
@@ -1175,8 +1185,10 @@ async function pollVpStatus() {
 async function startVpJob() {
   const body = {
     scope: document.getElementById('vpScope').value || 'multi_and_watch',
-    processes: parseInt(document.getElementById('vpProcs').value || '2', 10),
-    threads: parseInt(document.getElementById('vpThreads').value || '4', 10),
+    device: document.getElementById('vpDevice').value || 'auto',
+    batch_size: parseInt(document.getElementById('vpBatch').value || '64', 10),
+    processes: parseInt(document.getElementById('vpProcs').value || '1', 10),
+    threads: 4,
     limit: 0
   };
   const r = await fetch('/api/v1/admin/voiceprint/start', {

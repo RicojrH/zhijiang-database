@@ -124,7 +124,9 @@ class AsrStartRequest(BaseModel):
 
 class VoiceprintStartRequest(BaseModel):
     scope: str = Field(default="multi_and_watch", pattern="^(multi_and_watch|multi_only|all)$")
-    processes: int = Field(default=2, ge=1, le=4)
+    device: str = Field(default="auto", pattern="^(auto|cuda|cpu)$")
+    batch_size: int = Field(default=64, ge=8, le=256)
+    processes: int = Field(default=1, ge=1, le=4)
     threads: int = Field(default=4, ge=1, le=8)
     limit: int = Field(default=0, ge=0, le=5000)
 
@@ -695,14 +697,17 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
         env["TMP"] = str(tmp_dir)
         env["TEMP"] = str(tmp_dir)
         env["PYTHONIOENCODING"] = "utf-8"
+        env["CUDA_CACHE_MAXSIZE"] = "2147483648"
 
         py = sys.executable
         n_procs = max(1, min(4, int(body.processes)))
+        prefetch_per_proc = 3 if n_procs == 1 else 2
 
         def _spawn_vp() -> None:
             try:
                 _vp_log(
-                    f"启动声纹发言人标注：scope={body.scope}，并行进程={n_procs}，每进程线程={body.threads}"
+                    f"启动声纹发言人标注：scope={body.scope}，device={body.device}，"
+                    f"batch_size={body.batch_size}，并行进程={n_procs}，每进程并发拉流={prefetch_per_proc}"
                 )
                 local_procs: List[subprocess.Popen] = []
                 for idx in range(n_procs):
@@ -713,12 +718,16 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
                         "run-voiceprint",
                         "--scope",
                         body.scope,
+                        "--device",
+                        body.device,
+                        "--batch-size",
+                        str(body.batch_size),
                         "--limit",
                         str(body.limit),
                         "--threads",
                         str(body.threads),
                         "--prefetch",
-                        "2",
+                        str(prefetch_per_proc),
                     ]
                     if n_procs > 1:
                         cmd.extend(["--shard-index", str(idx), "--shard-total", str(n_procs)])

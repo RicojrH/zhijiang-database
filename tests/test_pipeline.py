@@ -438,17 +438,20 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     assert cloud_db.get_video("BV1DEMO000001", 1)["scene_type"] == "special"
     assert cloud_db.get_video("BV1DEMO000001", 1)["scene_locked"] == 1
 
-    # 4. 声纹发言人先验、精准发言人过滤、以及纯声纹云端轻量补丁校验
+    # 4. 声纹发言人先验、分桶对齐、精准发言人过滤、以及纯声纹云端轻量补丁校验
     from zhijiang_corpus.sync_delta import apply_speakers, export_speakers
-    from zhijiang_corpus.voiceprint import active_candidates_for_video
+    from zhijiang_corpus.voiceprint import _snap_audio_bounds, active_candidates_for_video
 
     assert "心宜" not in active_candidates_for_video(up_name="嘉然", pub_date="2022-08-01", scene_type="group")
     assert "向晚" not in active_candidates_for_video(up_name="嘉然", pub_date="2026-08-01", scene_type="group")
     assert active_candidates_for_video(up_name="贝拉", pub_date="2026-11-01", scene_type="solo") == ["贝拉"]
     assert active_candidates_for_video(up_name="心宜", pub_date="2026-08-09", scene_type="duo", title="【双人电台】") == ["心宜", "思诺"]
+    s0, e0 = _snap_audio_bounds(10.0, 10.95, 320000, 16000)
+    assert e0 - s0 == 15360  # 0.95s 精确对齐到 96 帧桶 (0.96s)
 
     vp_st = loc_client.get("/api/v1/admin/voiceprint/status").json()
     assert "progress" in vp_st and "job" in vp_st
+    assert "cuda_available" in vp_st["progress"]
 
     # 模拟本地写入声纹标注（含双人重叠与 其他/原声），验证 speaker_filter 跨频道检索与轻量同步补丁
     with db.session() as conn:

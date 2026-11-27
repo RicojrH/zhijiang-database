@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .asr_backfill import convert_to_16k_wav
+from .asr_backfill import convert_to_16k_wav, register_windows_cuda_dlls
 from .bilibili_client import BilibiliClient
 from .config import AppConfig, PROJECT_ROOT
 from .db import CorpusDB
@@ -39,6 +39,60 @@ VOICEPRINT_CACHE_DIR = PROJECT_ROOT / "data" / "cache" / "voiceprint"
 CAMP_MODEL_NAME = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 WESP_MODEL_NAME = "wespeaker_zh_cnceleb_resnet34_LM.onnx"
 BANK_FILE_NAME = "zhijiang_6members_v3.npz"
+
+# GPU 批量分桶步长：16 帧 = 0.16 秒（2560 采样点），在不引入任何零填充失真的前提下将全片窗口聚合成少数定长 Batch
+_BUCKET_STEP_SAMPLES = 2560
+_MIN_SEG_SAMPLES = 7200       # 0.45s
+_MIN_BUCKET_SAMPLES = 7680    # 0.48s = 48 frames
+_MAX_BUCKET_SAMPLES = 102400  # 6.40s = 640 frames
+
+
+def is_voiceprint_cuda_available() -> bool:
+    """快速检测当前环境是否具备 ONNX Runtime CUDA GPU + Kaldi Fbank 推理条件."""
+    try:
+        register_windows_cuda_dlls()
+        import kaldi_native_fbank  # noqa: F401
+        import onnxruntime as ort
+
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
+
+
+def _snap_audio_bounds(
+    start_sec: float,
+    end_sec: float,
+    total_samples: int,
+    sr: int,
+    *,
+    quantize_step: int = _BUCKET_STEP_SAMPLES,
+) -> Tuple[int, int]:
+    """将请求音频区间按中心对称对齐到固定帧桶长度，保证同桶样本精确等长且零填充."""
+    if total_samples <= 0 or sr <= 0:
+        return 0, 0
+    i0 = max(0, int(round(start_sec * sr)))
+    i1 = min(total_samples, int(round(end_sec * sr)))
+    raw_len = i1 - i0
+    if raw_len < int(0.45 * sr):
+        return i0, i1
+    if sr != 16000 or quantize_step <= 0:
+        return i0, i1
+
+    target = int(round(raw_len / quantize_step)) * quantize_step
+    target = max(_MIN_BUCKET_SAMPLES, min(_MAX_BUCKET_SAMPLES, target))
+    if target > total_samples:
+        return 0, total_samples
+
+    center = (i0 + i1) // 2
+    s = center - target // 2
+    e = s + target
+    if s < 0:
+        s = 0
+        e = target
+    elif e > total_samples:
+        e = total_samples
+        s = total_samples - target
+    return s, e
 
 WATCH_ALONG_KEYWORDS = (
     "影厅",
@@ -178,22 +232,17 @@ def load_wav_float32(wav_path: Path) -> Tuple[np.ndarray, int]:
 
 
 class VoiceprintEngine:
-    """正式版双模型声纹识别器（CAM++ + WeSpeaker CN-Celeb + 滑窗换人/重叠检测 + 上下文平滑）."""
+    """正式版双模型声纹识别器（支持 CUDA GPU 批量分桶推理 + CPU 自动回退）."""
 
     def __init__(
         self,
         *,
         cache_dir: Path = VOICEPRINT_CACHE_DIR,
+        device: str = "auto",
+        batch_size: int = 64,
         num_threads: int = 4,
         reject_cos_th: float = 0.36,
     ):
-        try:
-            import sherpa_onnx
-        except ImportError as exc:
-            raise RuntimeError(
-                "未安装 sherpa-onnx，请先执行 .\\.venv\\Scripts\\python.exe -m pip install sherpa-onnx"
-            ) from exc
-
         camp_path = cache_dir / CAMP_MODEL_NAME
         wesp_path = cache_dir / WESP_MODEL_NAME
         bank_path = cache_dir / BANK_FILE_NAME
@@ -214,11 +263,95 @@ class VoiceprintEngine:
         self.w_camp: float = float(z["w_camp"])
         self.w_wesp: float = float(z["w_wesp"])
         self.reject_cos_th: float = reject_cos_th
+        self.batch_size: int = max(4, int(batch_size))
 
         self._camp_by_cls: Dict[int, np.ndarray] = {
             i: self.X_camp[self.y == i] for i in range(len(self.members))
         }
 
+        self.device: str = "cpu"
+        self.backend: str = "sherpa-onnx (CPU)"
+        self._ort_camp = None
+        self._ort_wesp = None
+        self._ort_camp_in: str = "x"
+        self._ort_wesp_in: str = "feats"
+        self._knf = None
+        self._fbank_opts = None
+        self._ex_camp = None
+        self._ex_wesp = None
+
+        want = (device or "auto").strip().lower()
+        if want in ("auto", "cuda"):
+            if self._try_init_cuda(camp_path, wesp_path):
+                return
+            if want == "cuda":
+                raise RuntimeError(
+                    "已指定 CUDA GPU 加速但未能初始化 ONNX Runtime CUDAExecutionProvider，"
+                    "请检查 onnxruntime-gpu、kaldi-native-fbank 及 CUDA 12 运行库。"
+                )
+
+        self._init_cpu_sherpa(camp_path, wesp_path, num_threads=num_threads)
+
+    def _try_init_cuda(self, camp_path: Path, wesp_path: Path) -> bool:
+        try:
+            os.environ.setdefault("CUDA_CACHE_MAXSIZE", "2147483648")
+            register_windows_cuda_dlls()
+            import kaldi_native_fbank as knf
+            import onnxruntime as ort
+
+            if hasattr(ort, "preload_dlls"):
+                try:
+                    ort.preload_dlls()
+                except Exception:
+                    pass
+
+            if "CUDAExecutionProvider" not in ort.get_available_providers():
+                return False
+
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            so.log_severity_level = 3
+            cuda_opts = {
+                "cudnn_conv_algo_search": "HEURISTIC",
+                "arena_extend_strategy": "kSameAsRequested",
+            }
+            providers = [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
+            s_camp = ort.InferenceSession(str(camp_path), sess_options=so, providers=providers)
+            s_wesp = ort.InferenceSession(str(wesp_path), sess_options=so, providers=providers)
+            if (
+                "CUDAExecutionProvider" not in s_camp.get_providers()
+                or "CUDAExecutionProvider" not in s_wesp.get_providers()
+            ):
+                return False
+
+            opts = knf.FbankOptions()
+            opts.frame_opts.dither = 0.0
+            opts.frame_opts.samp_freq = 16000.0
+            opts.frame_opts.snip_edges = False
+            opts.frame_opts.window_type = "povey"
+            opts.mel_opts.num_bins = 80
+            opts.mel_opts.low_freq = 20.0
+            opts.mel_opts.high_freq = -400.0
+
+            self._ort_camp = s_camp
+            self._ort_wesp = s_wesp
+            self._ort_camp_in = s_camp.get_inputs()[0].name
+            self._ort_wesp_in = s_wesp.get_inputs()[0].name
+            self._knf = knf
+            self._fbank_opts = opts
+            self.device = "cuda"
+            self.backend = f"onnxruntime-gpu (CUDA, batch={self.batch_size})"
+            return True
+        except Exception:
+            return False
+
+    def _init_cpu_sherpa(self, camp_path: Path, wesp_path: Path, *, num_threads: int) -> None:
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise RuntimeError(
+                "未安装 sherpa-onnx，请先执行 .\\.venv\\Scripts\\python.exe -m pip install sherpa-onnx"
+            ) from exc
         self._ex_camp = sherpa_onnx.SpeakerEmbeddingExtractor(
             sherpa_onnx.SpeakerEmbeddingExtractorConfig(
                 model=str(camp_path),
@@ -233,8 +366,33 @@ class VoiceprintEngine:
                 provider="cpu",
             )
         )
+        self.device = "cpu"
+        self.backend = f"sherpa-onnx (CPU, threads={max(1, int(num_threads))})"
 
-    def _extract_pair(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def _compute_fbank_pair(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """提取与 sherpa-onnx 位级对齐的 80 维 Kaldi Fbank（cos >= 0.9999）."""
+        assert self._knf is not None and self._fbank_opts is not None
+        opts = self._fbank_opts
+        if sr != 16000:
+            opts = self._knf.FbankOptions()
+            opts.frame_opts.dither = 0.0
+            opts.frame_opts.samp_freq = float(sr)
+            opts.frame_opts.snip_edges = False
+            opts.frame_opts.window_type = "povey"
+            opts.mel_opts.num_bins = 80
+            opts.mel_opts.low_freq = 20.0
+            opts.mel_opts.high_freq = -400.0
+        fb = self._knf.OnlineFbank(opts)
+        fb.accept_waveform(sr, (seg * 32768.0).tolist())
+        fb.input_finished()
+        n_frames = fb.num_frames_ready
+        if n_frames < 10:
+            return None
+        fw = np.stack([fb.get_frame(i) for i in range(n_frames)], axis=0).astype(np.float32)
+        fc = fw - fw.mean(axis=0, keepdims=True)
+        return fc, fw
+
+    def _extract_pair_cpu(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         if len(seg) < int(0.45 * sr):
             return None
         if float(np.sqrt(np.mean(seg * seg) + 1e-12)) < 0.004:
@@ -243,6 +401,7 @@ class VoiceprintEngine:
 
         vecs: List[np.ndarray] = []
         for ex in (self._ex_camp, self._ex_wesp):
+            assert ex is not None
             st = ex.create_stream()
             st.accept_waveform(sr, seg_list)
             st.input_finished()
@@ -257,6 +416,68 @@ class VoiceprintEngine:
         vc, vw = vecs[0], vecs[1]
         vj = _l2_norm(np.concatenate([self.w_camp * vc, self.w_wesp * vw]).astype(np.float32))
         return vc, vj
+
+    def _extract_pair(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if self.device == "cuda":
+            return self.extract_pairs_batch([seg], sr)[0]
+        return self._extract_pair_cpu(seg, sr)
+
+    def extract_pairs_batch(
+        self,
+        segments: Sequence[np.ndarray],
+        sr: int,
+    ) -> List[Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """按帧长分桶执行无填充 GPU 批量声纹提取（CPU 模式下自动逐条回退）."""
+        out: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * len(segments)
+        if not segments:
+            return out
+
+        if self.device != "cuda":
+            for idx, seg in enumerate(segments):
+                out[idx] = self._extract_pair_cpu(seg, sr)
+            return out
+
+        assert self._ort_camp is not None and self._ort_wesp is not None
+        min_len = int(0.45 * sr)
+        buckets: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]] = {}
+        for idx, seg in enumerate(segments):
+            if len(seg) < min_len:
+                continue
+            if float(np.sqrt(np.mean(seg * seg) + 1e-12)) < 0.004:
+                continue
+            pair_fb = self._compute_fbank_pair(seg, sr)
+            if pair_fb is None:
+                continue
+            fc, fw = pair_fb
+            t_frames = int(fc.shape[0])
+            buckets.setdefault(t_frames, []).append((idx, fc, fw))
+
+        bs = self.batch_size
+        for items in buckets.values():
+            for off in range(0, len(items), bs):
+                chunk = items[off : off + bs]
+                batch_c = np.stack([it[1] for it in chunk], axis=0)
+                batch_w = np.stack([it[2] for it in chunk], axis=0)
+                raw_c = np.asarray(
+                    self._ort_camp.run(None, {self._ort_camp_in: batch_c})[0],
+                    dtype=np.float32,
+                )
+                raw_w = np.asarray(
+                    self._ort_wesp.run(None, {self._ort_wesp_in: batch_w})[0],
+                    dtype=np.float32,
+                )
+                norms_c = np.linalg.norm(raw_c, axis=-1, keepdims=True)
+                norms_w = np.linalg.norm(raw_w, axis=-1, keepdims=True)
+                vcs = raw_c / np.maximum(norms_c, 1e-8)
+                vws = raw_w / np.maximum(norms_w, 1e-8)
+                vjs = _l2_norm(
+                    np.concatenate([self.w_camp * vcs, self.w_wesp * vws], axis=-1).astype(np.float32)
+                )
+                for local_i, (orig_idx, _, _) in enumerate(chunk):
+                    if float(norms_c[local_i, 0]) <= 1e-8 or float(norms_w[local_i, 0]) <= 1e-8:
+                        continue
+                    out[orig_idx] = (vcs[local_i], vjs[local_i])
+        return out
 
     def score_window(
         self,
@@ -319,32 +540,40 @@ class VoiceprintEngine:
         scene_type: str,
         title: str = "",
     ) -> List[Tuple[int, str, float]]:
-        """对单个分 P 的全部字幕行执行声纹发言人标注与局部上下文平滑."""
+        """对单个分 P 的全部字幕行执行全片分桶批量声纹标注与局部上下文平滑."""
         cands = active_candidates_for_video(
             up_name=up_name,
             pub_date=pub_date,
             scene_type=scene_type,
             title=title,
         )
-        total_audio_sec = len(audio) / float(sr)
-        raw_results: List[Tuple[int, float, float, str, float]] = []
+        total_samples = len(audio)
+        total_audio_sec = total_samples / float(sr) if sr > 0 else 0.0
+        use_snap = self.device == "cuda"
+
+        def _slice(ws: float, we: float) -> np.ndarray:
+            we_c = min(we, total_audio_sec)
+            if use_snap:
+                i0, i1 = _snap_audio_bounds(ws, we_c, total_samples, sr)
+            else:
+                i0 = max(0, int(ws * sr))
+                i1 = min(total_samples, int(we_c * sr))
+            return audio[i0:i1]
+
+        # Phase 1: 收集全片所有单窗 / 滑窗切片，一次分桶批量送入 GPU 提取声纹
+        phase1_segs: List[np.ndarray] = []
+        # mode='single': (line_idx, seg_idx) | mode='multi': (line_idx, [seg_indices])
+        line_plans: List[Tuple[str, Any]] = []
 
         for sid, s0, e0, _ in subtitles:
             dur = max(0.0, e0 - s0)
             if dur < 1.35 or len(cands) <= 1:
                 pad = max(0.08, (0.85 - dur) * 0.5) if dur < 0.85 else 0.08
-                i0 = max(0, int((s0 - pad) * sr))
-                i1 = min(len(audio), int((e0 + pad) * sr))
-                pair = self._extract_pair(audio[i0:i1], sr)
-                if pair is None:
-                    raw_results.append((sid, s0, e0, "", 0.0))
-                    continue
-                lbl, _, _, cs, pr = self.score_window(pair[0], pair[1], cands)
-                conf = round(min(0.99, max(0.0, 0.5 * cs + 0.5 * pr)) if lbl != NON_MEMBER_LABEL else max(0.0, 1.0 - cs), 3)
-                raw_results.append((sid, s0, e0, lbl, conf))
+                seg_idx = len(phase1_segs)
+                phase1_segs.append(_slice(max(0.0, s0 - pad), e0 + pad))
+                line_plans.append(("single", seg_idx))
                 continue
 
-            # >= 1.35s 多人场字幕：句内滑窗检出换人 / 合唱重叠
             if dur <= 2.3:
                 mid = (s0 + e0) * 0.5
                 wins = [(s0, min(e0, mid + 0.15)), (max(s0, mid - 0.15), e0)]
@@ -359,13 +588,40 @@ class VoiceprintEngine:
                         break
                     t += 0.50
 
+            w_indices: List[int] = []
+            for ws, we in wins:
+                w_indices.append(len(phase1_segs))
+                phase1_segs.append(_slice(ws, we))
+            line_plans.append(("multi", w_indices))
+
+        phase1_pairs = self.extract_pairs_batch(phase1_segs, sr)
+
+        raw_results: List[Tuple[int, float, float, str, float]] = [
+            (sid, s0, e0, "", 0.0) for sid, s0, e0, _ in subtitles
+        ]
+        fallback_line_indices: List[int] = []
+        fallback_segs: List[np.ndarray] = []
+
+        for line_idx, ((sid, s0, e0, _), (mode, ref)) in enumerate(zip(subtitles, line_plans)):
+            if mode == "single":
+                pair = phase1_pairs[ref]
+                if pair is None:
+                    continue
+                lbl, _, _, cs, pr = self.score_window(pair[0], pair[1], cands)
+                conf = round(
+                    min(0.99, max(0.0, 0.5 * cs + 0.5 * pr))
+                    if lbl != NON_MEMBER_LABEL
+                    else max(0.0, 1.0 - cs),
+                    3,
+                )
+                raw_results[line_idx] = (sid, s0, e0, lbl, conf)
+                continue
+
             ord_sp: List[str] = []
             votes: Counter[str] = Counter()
             best_conf: Dict[str, float] = {}
-            for ws, we in wins:
-                i0 = max(0, int(ws * sr))
-                i1 = min(len(audio), int(min(we, total_audio_sec) * sr))
-                pair = self._extract_pair(audio[i0:i1], sr)
+            for seg_idx in ref:
+                pair = phase1_pairs[seg_idx]
                 if pair is None:
                     continue
                 lbl, sps, is_ov, cs, pr = self.score_window(pair[0], pair[1], cands)
@@ -386,25 +642,34 @@ class VoiceprintEngine:
 
             uniq = [s for s in ord_sp if votes[s] >= 1]
             if not uniq:
-                i0 = max(0, int(s0 * sr))
-                i1 = min(len(audio), int(min(e0, total_audio_sec) * sr))
-                pair = self._extract_pair(audio[i0:i1], sr)
-                if pair is None:
-                    raw_results.append((sid, s0, e0, "", 0.0))
-                else:
-                    lbl, _, _, cs, pr = self.score_window(pair[0], pair[1], cands)
-                    conf = round(min(0.99, max(0.0, 0.5 * cs + 0.5 * pr)) if lbl != NON_MEMBER_LABEL else max(0.0, 1.0 - cs), 3)
-                    raw_results.append((sid, s0, e0, lbl, conf))
+                fallback_line_indices.append(line_idx)
+                fallback_segs.append(_slice(s0, e0))
             elif len(uniq) == 1:
                 sp = uniq[0]
-                raw_results.append((sid, s0, e0, sp, round(min(0.99, best_conf[sp]), 3)))
+                raw_results[line_idx] = (sid, s0, e0, sp, round(min(0.99, best_conf[sp]), 3))
             else:
                 top2 = sorted(uniq, key=lambda s: votes[s], reverse=True)[:2]
                 top2_ord = [s for s in ord_sp if s in top2]
                 conf = round(min(0.99, max(best_conf[s] for s in top2_ord)), 3)
-                raw_results.append((sid, s0, e0, "+".join(top2_ord), conf))
+                raw_results[line_idx] = (sid, s0, e0, "+".join(top2_ord), conf)
 
-        # 局部上下文平滑：被同一位高置信发言人紧贴包夹的超短句（<0.9s，置信度<0.65）顺滑归入
+        # Phase 2: 仅对滑窗未达成高置信投票的少量长句，整句批量回退识别一次
+        if fallback_segs:
+            fb_pairs = self.extract_pairs_batch(fallback_segs, sr)
+            for line_idx, pair in zip(fallback_line_indices, fb_pairs):
+                if pair is None:
+                    continue
+                sid, s0, e0, _ = subtitles[line_idx]
+                lbl, _, _, cs, pr = self.score_window(pair[0], pair[1], cands)
+                conf = round(
+                    min(0.99, max(0.0, 0.5 * cs + 0.5 * pr))
+                    if lbl != NON_MEMBER_LABEL
+                    else max(0.0, 1.0 - cs),
+                    3,
+                )
+                raw_results[line_idx] = (sid, s0, e0, lbl, conf)
+
+        # Phase 3: 局部上下文平滑：被同一位高置信发言人紧贴包夹的超短句（<0.9s，置信度<0.65）顺滑归入
         smoothed: List[Tuple[int, str, float]] = []
         n = len(raw_results)
         for i, (sid, s0, e0, lbl, conf) in enumerate(raw_results):
@@ -505,6 +770,7 @@ def get_voiceprint_progress(db: CorpusDB) -> Dict[str, Any]:
             or all((VOICEPRINT_CACHE_DIR / f"v3_feats_{m}.npz").exists() for m in VOICEPRINT_MEMBERS)
         )
     )
+    cuda_ok = is_voiceprint_cuda_available()
     return {
         "targets_total": total_p,
         "done_parts": done_p,
@@ -515,6 +781,8 @@ def get_voiceprint_progress(db: CorpusDB) -> Dict[str, Any]:
         "all_done_parts": int(any_done["c"] or 0),
         "all_done_lines": int(any_done["lines"] or 0),
         "model_ready": bank_ready,
+        "cuda_available": cuda_ok,
+        "compute_backend": "CUDA GPU (onnxruntime-gpu)" if cuda_ok else "CPU (sherpa-onnx)",
     }
 
 
@@ -526,12 +794,14 @@ def run_voiceprint_batch(
     limit: int = 0,
     shard_index: int = 0,
     shard_total: int = 1,
+    device: str = "auto",
+    batch_size: int = 64,
     num_threads: int = 4,
-    prefetch: int = 2,
+    prefetch: int = 3,
     force: bool = False,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> Dict[str, Any]:
-    """后台流水线批量声纹标注（预取音频 + CAM++/WeSpeaker 逐行识别 + WAL 事务写库 + 立即删临时音频）."""
+    """后台流水线批量声纹标注（多线程并发预取音频 + GPU 批量推理 + WAL 事务写库 + 立即删临时音频）."""
     emit = progress_cb or (lambda msg: print(msg, flush=True))
     targets = list_voiceprint_targets(
         db,
@@ -547,64 +817,83 @@ def run_voiceprint_batch(
         return {"targets": 0, "done": 0, "failed": 0, "lines_labeled": 0}
 
     emit(
-        f"{shard_tag}选中 {len(targets)} 个分 P (scope={scope})，正在加载 CAM++ & WeSpeaker 双模型..."
+        f"{shard_tag}选中 {len(targets)} 个分 P (scope={scope})，正在加载 CAM++ & WeSpeaker 双模型 (device={device})..."
     )
-    engine = VoiceprintEngine(num_threads=num_threads)
+    engine = VoiceprintEngine(device=device, batch_size=batch_size, num_threads=num_threads)
+    n_prefetch = max(1, min(4, int(prefetch)))
+    emit(f"{shard_tag}声纹引擎就绪：{engine.backend}，并发下载/转码线程={n_prefetch}")
     tmp_root = Path(tempfile.gettempdir()) / "zhijiang_vp"
     tmp_root.mkdir(parents=True, exist_ok=True)
 
+    # 共享任务索引队列 + 多线程并发预取，避免 GPU 等待 B 站流下载与 FFmpeg 解码
+    src_q: "queue.Queue[Optional[Tuple[int, Dict[str, Any]]]]" = queue.Queue()
+    for idx, item in enumerate(targets, 1):
+        src_q.put((idx, item))
+    for _ in range(n_prefetch):
+        src_q.put(None)
+
     task_q: "queue.Queue[Optional[Tuple[int, Dict[str, Any], Optional[Path], Optional[str]]]]" = queue.Queue(
-        maxsize=max(2, prefetch * 2)
+        maxsize=max(3, n_prefetch * 2)
     )
     stop_ev = threading.Event()
+    alive_pf = [n_prefetch]
+    alive_lock = threading.Lock()
 
     def _prefetch_worker() -> None:
-        with BilibiliClient(cookie=cfg.bilibili_cookie, delay=0.25, jitter=0.1) as bili:
-            for idx, item in enumerate(targets, 1):
-                if stop_ev.is_set():
-                    break
-                bvid = str(item["bvid"])
-                page = int(item["page"])
-                cid = int(item.get("cid") or 0)
-                uid = uuid.uuid4().hex[:8]
-                m4a = tmp_root / f"{bvid}_p{page}_{uid}.m4a"
-                wav = tmp_root / f"{bvid}_p{page}_{uid}.wav"
-                err_msg: Optional[str] = None
-                try:
-                    if not cid:
-                        info = bili.fetch_video_info(bvid)
-                        for p in info.pages:
-                            if p.page == page:
-                                cid = p.cid
+        try:
+            with BilibiliClient(cookie=cfg.bilibili_cookie, delay=0.2, jitter=0.1) as bili:
+                while not stop_ev.is_set():
+                    job = src_q.get()
+                    if job is None:
+                        break
+                    idx, item = job
+                    bvid = str(item["bvid"])
+                    page = int(item["page"])
+                    cid = int(item.get("cid") or 0)
+                    uid = uuid.uuid4().hex[:8]
+                    m4a = tmp_root / f"{bvid}_p{page}_{uid}.m4a"
+                    wav = tmp_root / f"{bvid}_p{page}_{uid}.wav"
+                    err_msg: Optional[str] = None
+                    try:
+                        if not cid:
+                            info = bili.fetch_video_info(bvid)
+                            for p in info.pages:
+                                if p.page == page:
+                                    cid = p.cid
+                                    break
+                        if not cid:
+                            raise RuntimeError(f"无法获取 cid: {bvid} P{page}")
+                        last_e: Optional[Exception] = None
+                        for attempt in range(3):
+                            try:
+                                urls = bili.get_audio_stream_urls(bvid, cid)
+                                bili.download_stream_file(urls, m4a, bvid=bvid)
+                                convert_to_16k_wav(m4a, wav)
+                                last_e = None
                                 break
-                    if not cid:
-                        raise RuntimeError(f"无法获取 cid: {bvid} P{page}")
-                    last_e: Optional[Exception] = None
-                    for attempt in range(3):
-                        try:
-                            urls = bili.get_audio_stream_urls(bvid, cid)
-                            bili.download_stream_file(urls, m4a, bvid=bvid)
-                            convert_to_16k_wav(m4a, wav)
-                            last_e = None
-                            break
-                        except Exception as exc:
-                            last_e = exc
-                            m4a.unlink(missing_ok=True)
-                            wav.unlink(missing_ok=True)
-                            if attempt < 2:
-                                time.sleep(2.0 * (attempt + 1))
-                    if last_e is not None:
-                        raise last_e
-                except Exception as exc:
-                    err_msg = str(exc)
-                    wav.unlink(missing_ok=True)
-                finally:
-                    m4a.unlink(missing_ok=True)
-                task_q.put((idx, item, None if err_msg else wav, err_msg))
-        task_q.put(None)
+                            except Exception as exc:
+                                last_e = exc
+                                m4a.unlink(missing_ok=True)
+                                wav.unlink(missing_ok=True)
+                                if attempt < 2:
+                                    time.sleep(2.0 * (attempt + 1))
+                        if last_e is not None:
+                            raise last_e
+                    except Exception as exc:
+                        err_msg = str(exc)
+                        wav.unlink(missing_ok=True)
+                    finally:
+                        m4a.unlink(missing_ok=True)
+                    task_q.put((idx, item, None if err_msg else wav, err_msg))
+        finally:
+            with alive_lock:
+                alive_pf[0] -= 1
+                if alive_pf[0] <= 0:
+                    task_q.put(None)
 
-    t_pf = threading.Thread(target=_prefetch_worker, daemon=True)
-    t_pf.start()
+    pf_threads = [threading.Thread(target=_prefetch_worker, daemon=True) for _ in range(n_prefetch)]
+    for t in pf_threads:
+        t.start()
 
     done = 0
     failed = 0
@@ -668,11 +957,12 @@ def run_voiceprint_batch(
                     )
                 done += 1
                 lines_labeled += len(labeled)
+                dt = max(0.05, time.perf_counter() - t0)
                 top_dist = Counter(sp for _, sp, _ in labeled if sp).most_common(4)
                 dist_str = ", ".join(f"{k}:{v}" for k, v in top_dist)
                 emit(
                     f"{shard_tag}[{idx}/{len(targets)}] 完成 {up_name} {bvid} P{page} "
-                    f"({len(labeled)}行, {time.perf_counter() - t0:.1f}s) | {dist_str}"
+                    f"({len(labeled)}行, {dt:.1f}s, {len(labeled)/dt:.0f}行/s) | {dist_str}"
                 )
             except Exception as exc:
                 failed += 1
@@ -681,12 +971,15 @@ def run_voiceprint_batch(
                 wav_path.unlink(missing_ok=True)
     finally:
         stop_ev.set()
-        t_pf.join(timeout=5)
+        for t in pf_threads:
+            t.join(timeout=5)
 
     return {
         "targets": len(targets),
         "done": done,
         "failed": failed,
         "lines_labeled": lines_labeled,
+        "device": engine.device,
+        "backend": engine.backend,
         "elapsed_sec": round(time.perf_counter() - t_all, 1),
     }
