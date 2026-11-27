@@ -13,6 +13,7 @@ from .normalizer import build_fuzzy_fts_query
 class SearchQuery:
     q: str = ""
     up_names: Optional[Sequence[str]] = None
+    speakers: Optional[Sequence[str]] = None
     date_from: Optional[str] = None
     date_to: Optional[str] = None
     scene_types: Optional[Sequence[str]] = None
@@ -79,29 +80,43 @@ class SearchService:
         if not req.include_hidden:
             where_clauses.append("s.is_visible = 1")
 
-        if req.up_names:
-            cleaned_ups = [u.strip() for u in req.up_names if u and u.strip()]
-            if cleaned_ups:
-                placeholders = ",".join("?" for _ in cleaned_ups)
-                if req.speaker_filter:
-                    # 声纹发言人精准筛选：
-                    # 1) 已做声纹标注的行：按实际发言人匹配（含单人及 A+B 双人重叠/换人，且跨频道捞出本人发言）
-                    # 2) 未做声纹标注的纯单播行：平滑回退至录播频道 up_name
-                    sp_checks = []
-                    for u in cleaned_ups:
-                        sp_checks.append(
-                            "(s.speaker_name = ? OR s.speaker_name LIKE ? OR s.speaker_name LIKE ?)"
-                        )
-                        params.extend([u, f"{u}+%", f"%+{u}"])
-                    where_clauses.append(
-                        f"(({' OR '.join(sp_checks)}) OR (s.speaker_name = '' AND s.scene_type = 'solo' AND s.up_name IN ({placeholders})))"
-                    )
-                    params.extend(cleaned_ups)
-                else:
-                    where_clauses.append(f"s.up_name IN ({placeholders})")
-                    params.extend(cleaned_ups)
+        cleaned_ups = (
+            [u.strip() for u in req.up_names if u and u.strip()]
+            if req.up_names
+            else []
+        )
+        cleaned_speakers = (
+            [sp.strip() for sp in req.speakers if sp and sp.strip()]
+            if req.speakers
+            else []
+        )
 
-        if req.speaker_filter:
+        # 向后兼容旧版 speaker_filter=True 且未传 speakers 的调用
+        legacy_speaker_mode = bool(req.speaker_filter and not cleaned_speakers)
+        if legacy_speaker_mode and cleaned_ups:
+            cleaned_speakers = list(cleaned_ups)
+            cleaned_ups = []
+
+        # 1) 直播间（录播所属频道）过滤：可与「发言人」独立 AND 组合
+        if cleaned_ups:
+            placeholders = ",".join("?" for _ in cleaned_ups)
+            where_clauses.append(f"s.up_name IN ({placeholders})")
+            params.extend(cleaned_ups)
+
+        # 2) 发言人（声纹识别 + 单播默认本人）过滤
+        if cleaned_speakers:
+            sp_placeholders = ",".join("?" for _ in cleaned_speakers)
+            sp_checks = []
+            for sp in cleaned_speakers:
+                sp_checks.append(
+                    "(s.speaker_name = ? OR s.speaker_name LIKE ? OR s.speaker_name LIKE ? OR s.speaker_name LIKE ?)"
+                )
+                params.extend([sp, f"{sp}+%", f"%+{sp}", f"%+{sp}+%"])
+            where_clauses.append(
+                f"(({' OR '.join(sp_checks)}) OR (s.speaker_name = '' AND s.scene_type = 'solo' AND s.up_name IN ({sp_placeholders})))"
+            )
+            params.extend(cleaned_speakers)
+        elif req.speaker_filter:
             where_clauses.append("s.speaker_name != '其他/原声'")
 
         if req.date_from:
@@ -255,6 +270,7 @@ class SearchService:
             "fuzzy_expanded": fuzzy_expanded,
             "filters": {
                 "up_names": list(req.up_names) if req.up_names else None,
+                "speakers": list(req.speakers) if req.speakers else None,
                 "date_from": req.date_from,
                 "date_to": req.date_to,
                 "scene_types": list(req.scene_types) if req.scene_types else None,

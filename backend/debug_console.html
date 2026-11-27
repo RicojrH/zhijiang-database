@@ -153,7 +153,7 @@
         <button class="btn sec" onclick="resetFilters()">重置</button>
       </div>
       <div class="chips" id="upChips">
-        <span style="font-size:13px;color:var(--muted);">UP 主：</span>
+        <span style="font-size:13px;color:var(--muted);">直播间：</span>
         <button class="chip active" data-up="" onclick="toggleUp(this)">全部</button>
         <button class="chip" data-up="嘉然" style="border-color:#e799b0;color:#9c3a5a;" onclick="toggleUp(this)">嘉然</button>
         <button class="chip" data-up="贝拉" style="border-color:#db7d74;color:#a13a31;" onclick="toggleUp(this)">贝拉</button>
@@ -161,6 +161,17 @@
         <button class="chip" data-up="向晚" style="border-color:#9ac8e2;color:#225f80;" onclick="toggleUp(this)">向晚</button>
         <button class="chip" data-up="心宜" style="border-color:#c93773;color:#9d2256;" onclick="toggleUp(this)">心宜</button>
         <button class="chip" data-up="思诺" style="border-color:#7252c0;color:#513399;" onclick="toggleUp(this)">思诺</button>
+      </div>
+      <div class="chips" id="speakerChips" style="margin-top:8px;">
+        <span style="font-size:13px;color:var(--muted);">发言人：</span>
+        <button class="chip active" data-speaker="" onclick="toggleSpeaker(this)">全部</button>
+        <button class="chip" data-speaker="嘉然" style="border-color:#e799b0;color:#9c3a5a;" onclick="toggleSpeaker(this)">嘉然</button>
+        <button class="chip" data-speaker="贝拉" style="border-color:#db7d74;color:#a13a31;" onclick="toggleSpeaker(this)">贝拉</button>
+        <button class="chip" data-speaker="乃琳" style="border-color:#576690;color:#364369;" onclick="toggleSpeaker(this)">乃琳</button>
+        <button class="chip" data-speaker="向晚" style="border-color:#9ac8e2;color:#225f80;" onclick="toggleSpeaker(this)">向晚</button>
+        <button class="chip" data-speaker="心宜" style="border-color:#c93773;color:#9d2256;" onclick="toggleSpeaker(this)">心宜</button>
+        <button class="chip" data-speaker="思诺" style="border-color:#7252c0;color:#513399;" onclick="toggleSpeaker(this)">思诺</button>
+        <span style="font-size:12px;color:var(--muted);">发言人识别由声纹识别实现，可能出现错误，单播默认发言人为本人</span>
       </div>
       <div class="filters-row">
         <label>场景：
@@ -495,6 +506,7 @@
 
 <script>
 let selectedUps = new Set();
+let selectedSpeakers = new Set();
 let currentPage = 1;
 let totalPages = 0;
 const pageLimit = 20;
@@ -571,6 +583,22 @@ function toggleUp(el) {
   if (hasQuery()) runSearch(1);
 }
 
+function toggleSpeaker(el) {
+  const sp = el.dataset.speaker || '';
+  if (!sp) {
+    selectedSpeakers.clear();
+  } else if (selectedSpeakers.has(sp)) {
+    selectedSpeakers.delete(sp);
+  } else {
+    selectedSpeakers.add(sp);
+  }
+  document.querySelectorAll('#speakerChips .chip').forEach(c => {
+    const key = c.dataset.speaker || '';
+    c.classList.toggle('active', key === '' ? selectedSpeakers.size === 0 : selectedSpeakers.has(key));
+  });
+  if (hasQuery()) runSearch(1);
+}
+
 function resetFilters() {
   document.getElementById('qInput').value = '';
   document.getElementById('sceneFilter').value = '';
@@ -579,7 +607,9 @@ function resetFilters() {
   document.getElementById('bvidFilter').value = '';
   document.getElementById('sortFilter').value = 'date_desc';
   selectedUps.clear();
+  selectedSpeakers.clear();
   document.querySelectorAll('#upChips .chip').forEach(c => c.classList.toggle('active', c.dataset.up === ''));
+  document.querySelectorAll('#speakerChips .chip').forEach(c => c.classList.toggle('active', c.dataset.speaker === ''));
   document.getElementById('searchSummary').textContent = '请输入关键词或指定 BV 号 / 日期范围开始检索（默认不展示全量字幕）';
   document.getElementById('debugPagerTop').innerHTML = '';
   document.getElementById('debugPagerBottom').innerHTML = '';
@@ -634,6 +664,7 @@ async function runSearch(page) {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (selectedUps.size > 0) params.set('up_name', Array.from(selectedUps).join(','));
+  if (selectedSpeakers.size > 0) params.set('speaker', Array.from(selectedSpeakers).join(','));
   const scene = document.getElementById('sceneFilter').value;
   const df = document.getElementById('dateFrom').value;
   const dt = document.getElementById('dateTo').value;

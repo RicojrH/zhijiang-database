@@ -143,7 +143,11 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
     def search(
         q: str = Query(default="", description="检索关键词（空格分隔多词 AND）"),
         up_name: Optional[str] = Query(
-            default=None, description="UP 主简称过滤，支持逗号分隔多个，如 嘉然,向晚"
+            default=None, description="直播间（所属频道）过滤，支持逗号分隔多个，如 嘉然,向晚"
+        ),
+        speaker: Optional[str] = Query(
+            default=None,
+            description="发言人过滤（由声纹识别实现，单播默认本人），支持逗号分隔多个，如 嘉然,乃琳；可与 up_name 直播间组合使用",
         ),
         date_from: Optional[str] = Query(default=None, description="起始日期 YYYY-MM-DD"),
         date_to: Optional[str] = Query(default=None, description="截止日期 YYYY-MM-DD"),
@@ -158,19 +162,21 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
         ),
         speaker_filter: bool = Query(
             default=False,
-            description="开启声纹发言人精准筛选（隐藏电影/动画原声，选定成员时按声纹实际发言人跨频道匹配）",
+            description="向后兼容旧参数；推荐使用独立的 speaker 参数与 up_name 直播间组合筛选",
         ),
         sort: str = Query(default="date_desc", pattern="^(date_desc|date_asc|relevance)$"),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> Dict[str, Any]:
         up_list = [x.strip() for x in up_name.split(",") if x.strip()] if up_name else None
+        speaker_list = [x.strip() for x in speaker.split(",") if x.strip()] if speaker else None
         scene_list = (
             [x.strip() for x in scene_type.split(",") if x.strip()] if scene_type else None
         )
         req = SearchQuery(
             q=q,
             up_names=up_list,
+            speakers=speaker_list,
             date_from=date_from,
             date_to=date_to,
             scene_types=scene_list,

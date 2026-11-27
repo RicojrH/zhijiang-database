@@ -360,6 +360,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     db = CorpusDB(cfg.db_path)
     svc = SearchService(db)
     up_list = [x.strip() for x in args.up.split(",") if x.strip()] if args.up else None
+    speaker_list = [x.strip() for x in args.speaker.split(",") if x.strip()] if args.speaker else None
     scene_list = (
         [x.strip() for x in args.scene.split(",") if x.strip()] if args.scene else None
     )
@@ -367,6 +368,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         SearchQuery(
             q=args.q or "",
             up_names=up_list,
+            speakers=speaker_list,
             date_from=args.date_from,
             date_to=args.date_to,
             scene_types=scene_list,
@@ -617,7 +619,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser("search", help="关键词搜索字幕语料")
     p_search.add_argument("q", nargs="?", default="", help="搜索关键词（空格分隔多词 AND）")
-    p_search.add_argument("--up", default=None, help="UP 主过滤（可逗号分隔，如 嘉然,贝拉）")
+    p_search.add_argument("--up", default=None, help="直播间（UP 主频道）过滤（可逗号分隔，如 嘉然,贝拉）")
+    p_search.add_argument("--speaker", default=None, help="发言人过滤（声纹识别，单播默认本人，可逗号分隔，如 嘉然,乃琳）")
     p_search.add_argument("--date-from", default=None, help="起始日期 YYYY-MM-DD")
     p_search.add_argument("--date-to", default=None, help="结束日期 YYYY-MM-DD")
     p_search.add_argument("--scene", default=None, help="scene_type 过滤（可逗号分隔）")

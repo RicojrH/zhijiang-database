@@ -733,3 +733,66 @@ def test_incremental_delta_sync_and_live_stats(tmp_path: Path) -> None:
     # 4. 再次导出增量应为 0 变动
     exp2 = export_delta(local_db, build_manifest(cloud_db), delta_file)
     assert exp2["parts_changed"] == 0
+
+
+def test_room_and_speaker_independent_search(tmp_path: Path) -> None:
+    """验证「直播间 (up_name)」与「发言人 (speaker)」同级独立组合检索逻辑（单播默认本人）."""
+    from zhijiang_corpus.db import SubtitleRow, VideoRecord
+
+    db = CorpusDB(tmp_path / "speaker_search.db")
+    db.init_db()
+
+    # 1) 嘉然直播间 - 团播（已声纹标注：嘉然、乃琳、嘉然+乃琳、其他/原声）
+    v_group = VideoRecord(
+        bvid="BV1SPK000001", page=1, up_name="嘉然", pub_date="2026-11-20",
+        subtitle_status="ok", scene_type="group", voiceprint_status="ok",
+    )
+    s_group = [
+        SubtitleRow(up_name="嘉然", bvid="BV1SPK000001", page=1, pub_date="2026-11-20", start_sec=10.0, end_sec=12.0, content="火锅真好吃呀", scene_type="group", speaker_name="嘉然", speaker_conf=0.96),
+        SubtitleRow(up_name="嘉然", bvid="BV1SPK000001", page=1, pub_date="2026-11-20", start_sec=20.0, end_sec=22.0, content="火锅我也喜欢吃", scene_type="group", speaker_name="乃琳", speaker_conf=0.95),
+        SubtitleRow(up_name="嘉然", bvid="BV1SPK000001", page=1, pub_date="2026-11-20", start_sec=30.0, end_sec=32.0, content="火锅一起吃吧", scene_type="group", speaker_name="嘉然+乃琳", speaker_conf=0.91),
+        SubtitleRow(up_name="嘉然", bvid="BV1SPK000001", page=1, pub_date="2026-11-20", start_sec=40.0, end_sec=42.0, content="火锅电影旁白原声", scene_type="group", speaker_name="其他/原声", speaker_conf=0.88),
+    ]
+    db.save_video_and_subtitles(v_group, s_group)
+
+    # 2) 嘉然直播间 - 单播（未跑声纹，默认发言人为嘉然本人）
+    v_jr_solo = VideoRecord(
+        bvid="BV1SPK000002", page=1, up_name="嘉然", pub_date="2026-11-21",
+        subtitle_status="ok", scene_type="solo", voiceprint_status="",
+    )
+    db.save_video_and_subtitles(
+        v_jr_solo,
+        [SubtitleRow(up_name="嘉然", bvid="BV1SPK000002", page=1, pub_date="2026-11-21", start_sec=5.0, end_sec=7.0, content="单播吃火锅咯", scene_type="solo")],
+    )
+
+    # 3) 乃琳直播间 - 单播（未跑声纹，默认发言人为乃琳本人）
+    v_nl_solo = VideoRecord(
+        bvid="BV1SPK000003", page=1, up_name="乃琳", pub_date="2026-11-22",
+        subtitle_status="ok", scene_type="solo", voiceprint_status="",
+    )
+    db.save_video_and_subtitles(
+        v_nl_solo,
+        [SubtitleRow(up_name="乃琳", bvid="BV1SPK000003", page=1, pub_date="2026-11-22", start_sec=8.0, end_sec=10.0, content="乃琳单播聊火锅", scene_type="solo")],
+    )
+
+    pub_app = create_app(db_path=db.db_path, enable_admin=False)
+    client = TestClient(pub_app)
+
+    # A. 仅限直播间=嘉然（不过滤发言人）-> 嘉然直播间全部 5 条（含乃琳、合唱、原声、单播）
+    r_room = client.get("/api/v1/search", params={"q": "火锅", "up_name": "嘉然"}).json()
+    assert r_room["pagination"]["total"] == 5
+
+    # B. 仅限发言人=乃琳（跨全部直播间）-> 乃琳单播(1) + 嘉然团播里乃琳(1) + 嘉然+乃琳合唱(1) = 3 条
+    r_sp = client.get("/api/v1/search", params={"q": "火锅", "speaker": "乃琳"}).json()
+    assert r_sp["pagination"]["total"] == 3
+    assert {it["content"] for it in r_sp["items"]} == {"火锅我也喜欢吃", "火锅一起吃吧", "乃琳单播聊火锅"}
+
+    # C. 指定直播间=嘉然 且 发言人=乃琳 -> 只出嘉然直播间里乃琳说的话（含合唱）= 2 条，不含乃琳自己的单播
+    r_both_nl = client.get("/api/v1/search", params={"q": "火锅", "up_name": "嘉然", "speaker": "乃琳"}).json()
+    assert r_both_nl["pagination"]["total"] == 2
+    assert {it["content"] for it in r_both_nl["items"]} == {"火锅我也喜欢吃", "火锅一起吃吧"}
+
+    # D. 指定直播间=嘉然 且 发言人=嘉然 -> 嘉然团播本人(1) + 嘉然+乃琳(1) + 嘉然单播默认本人(1) = 3 条（排除乃琳独白与电影原声）
+    r_both_jr = client.get("/api/v1/search", params={"q": "火锅", "up_name": "嘉然", "speaker": "嘉然"}).json()
+    assert r_both_jr["pagination"]["total"] == 3
+    assert {it["content"] for it in r_both_jr["items"]} == {"火锅真好吃呀", "火锅一起吃吧", "单播吃火锅咯"}

@@ -42,6 +42,7 @@
 
   const state = {
     selectedUps: new Set(),
+    selectedSpeakers: new Set(),
     selectedScenes: new Set(),
     currentPage: 1,
     totalPages: 0,
@@ -115,6 +116,7 @@
     updateThemeButton(safeMode);
     applyThemeAccent();
     renderMemberChips();
+    renderSpeakerChips();
     renderLandingStatsAndCards();
     syncVisibleHitCardThemes();
   }
@@ -137,7 +139,9 @@
 
   function applyThemeAccent() {
     const root = document.documentElement;
-    const activeUp = state.selectedUps.size === 1 ? Array.from(state.selectedUps)[0] : "";
+    const activeUp = state.selectedUps.size === 1
+      ? Array.from(state.selectedUps)[0]
+      : (state.selectedSpeakers.size === 1 ? Array.from(state.selectedSpeakers)[0] : "");
     const t = getTheme(activeUp);
     root.style.setProperty("--accent", t.color);
     root.style.setProperty("--accent-bg", t.bg);
@@ -149,15 +153,20 @@
     const input = $("qInput");
     if (!input) return;
     const ups = Array.from(state.selectedUps);
-    if (ups.length === 1) {
+    const speakers = Array.from(state.selectedSpeakers);
+    if (ups.length > 0 && speakers.length > 0) {
+      input.placeholder = `在 ${ups.join("、")}直播间 中搜索 ${speakers.join("、")} 发言的台词、热梗或名场面…（空格分隔多词）`;
+    } else if (speakers.length > 0) {
+      input.placeholder = `跨全部直播间搜索 ${speakers.join("、")} 发言的台词、热梗或名场面…（空格分隔多词）`;
+    } else if (ups.length === 1) {
       const upName = ups[0];
       const upStat = state.stats && state.stats.by_up
         ? state.stats.by_up.find((u) => u.up_name === upName)
         : null;
       const countText = upStat ? ` ${Math.round(upStat.subtitle_lines / 10000)} 万+ 条` : "";
-      input.placeholder = `在 ${upName} 的${countText}字幕中搜索台词、热梗或名场面…（空格分隔多词）`;
+      input.placeholder = `在 ${upName}直播间 的${countText}字幕中搜索台词、热梗或名场面…（空格分隔多词）`;
     } else if (ups.length > 1) {
-      input.placeholder = `在 ${ups.join("、")} 的字幕中搜索台词、热梗或名场面…（空格分隔多词）`;
+      input.placeholder = `在 ${ups.join("、")}直播间 的字幕中搜索台词、热梗或名场面…（空格分隔多词）`;
     } else {
       input.placeholder = "搜台词、搜热梗、搜名场面… 如：小作文 / 嘉心糖 / 心球仪 / 黑魔法学院（空格分隔多词）";
     }
@@ -211,10 +220,10 @@
       ? "--chip-color:#8798C8;--chip-bg:rgba(135,152,200,0.16);--chip-ink:#EEF1F8;"
       : "--chip-color:#576690;--chip-bg:#F1F3F8;--chip-ink:#1B2232;";
     const allBtn = `
-      <span class="strip-label">成员（可多选）</span>
+      <span class="strip-label">直播间（可多选）</span>
       <button type="button" class="member-chip ${allActive}"
         data-up="" style="${allChipStyle}">
-        全部成员
+        全部直播间
       </button>
     `;
     const memberBtns = members.map((m) => {
@@ -233,6 +242,43 @@
     wrap.innerHTML = allBtn + memberBtns;
     wrap.querySelectorAll(".member-chip").forEach((btn) => {
       btn.addEventListener("click", () => toggleMember(btn.dataset.up || "", false));
+    });
+  }
+
+  function renderSpeakerChips() {
+    const wrap = $("speakerStrip");
+    if (!wrap) return;
+    const members = state.members.length
+      ? state.members
+      : Object.keys(MEMBER_THEMES).map((up_name) => ({ up_name, ...MEMBER_THEMES[up_name] }));
+
+    const allActive = state.selectedSpeakers.size === 0 ? "active" : "";
+    const allChipStyle = isDarkMode()
+      ? "--chip-color:#8798C8;--chip-bg:rgba(135,152,200,0.16);--chip-ink:#EEF1F8;"
+      : "--chip-color:#576690;--chip-bg:#F1F3F8;--chip-ink:#1B2232;";
+    const allBtn = `
+      <span class="strip-label">发言人（可多选）</span>
+      <button type="button" class="member-chip ${allActive}"
+        data-speaker="" style="${allChipStyle}">
+        全部发言人
+      </button>
+    `;
+    const speakerBtns = members.map((m) => {
+      const t = getTheme(m.up_name);
+      const color = m.color || t.color;
+      const active = state.selectedSpeakers.has(m.up_name) ? "active" : "";
+      return `
+        <button type="button" class="member-chip ${active}" data-speaker="${esc(m.up_name)}"
+          style="--chip-color:${color};--chip-bg:${t.bg};--chip-ink:${t.ink};">
+          <span class="color-dot" style="background:${color};"></span>
+          ${esc(m.up_name)}
+        </button>
+      `;
+    }).join("");
+
+    wrap.innerHTML = allBtn + speakerBtns;
+    wrap.querySelectorAll(".member-chip").forEach((btn) => {
+      btn.addEventListener("click", () => toggleSpeaker(btn.dataset.speaker || ""));
     });
   }
 
@@ -272,6 +318,27 @@
       if (focusInput) {
         $("qInput").focus();
       }
+    }
+  }
+
+  function toggleSpeaker(speakerName) {
+    if (!speakerName) {
+      state.selectedSpeakers.clear();
+    } else {
+      if (state.selectedSpeakers.has(speakerName)) {
+        state.selectedSpeakers.delete(speakerName);
+      } else {
+        state.selectedSpeakers.add(speakerName);
+      }
+      const totalMembers = state.members.length || 6;
+      if (state.selectedSpeakers.size >= totalMembers) {
+        state.selectedSpeakers.clear();
+      }
+    }
+    applyThemeAccent();
+    renderSpeakerChips();
+    if (hasActiveQueryCondition()) {
+      runSearch(1, false);
     }
   }
 
@@ -545,6 +612,9 @@
     if (state.selectedUps.size > 0) {
       params.set("up_name", Array.from(state.selectedUps).join(","));
     }
+    if (state.selectedSpeakers.size > 0) {
+      params.set("speaker", Array.from(state.selectedSpeakers).join(","));
+    }
     if (state.selectedScenes.size > 0) {
       params.set("scene_type", Array.from(state.selectedScenes).join(","));
     }
@@ -553,15 +623,12 @@
     const bv = $("bvidFilter").value.trim();
     const sort = $("sortFilter").value;
     const fuzzy = $("fuzzyToggle").checked;
-    const speakerToggleEl = $("speakerFilterToggle");
-    const speakerFilter = Boolean(speakerToggleEl && speakerToggleEl.checked);
 
     if (df) params.set("date_from", df);
     if (dt) params.set("date_to", dt);
     if (bv) params.set("bvid", bv);
     params.set("sort", sort);
     params.set("fuzzy", fuzzy ? "true" : "false");
-    params.set("speaker_filter", speakerFilter ? "true" : "false");
     params.set("limit", String(state.pageLimit));
     params.set("offset", String(offset));
 
@@ -584,8 +651,12 @@
 
       const startIdx = state.totalHits === 0 ? 0 : offset + 1;
       const endIdx = offset + (data.items ? data.items.length : 0);
+      const scopeParts = [];
+      if (state.selectedUps.size > 0) scopeParts.push(`直播间: ${Array.from(state.selectedUps).join("、")}`);
+      if (state.selectedSpeakers.size > 0) scopeParts.push(`发言人: ${Array.from(state.selectedSpeakers).join("、")}`);
+      const scopePrefix = scopeParts.length ? `【${scopeParts.join(" · ")}】` : "";
       $("resultSummaryText").textContent =
-        `共命中 ${formatNumber(state.totalHits)} 条字幕（第 ${state.currentPage} / ${Math.max(1, state.totalPages)} 页，显示 ${formatNumber(startIdx)}-${formatNumber(endIdx)}，耗时 ${elapsedMs}ms）`;
+        `${scopePrefix}共命中 ${formatNumber(state.totalHits)} 条字幕（第 ${state.currentPage} / ${Math.max(1, state.totalPages)} 页，显示 ${formatNumber(startIdx)}-${formatNumber(endIdx)}，耗时 ${elapsedMs}ms）`;
 
       const expEl = $("expandedHint");
       const expEntries = Object.entries(data.fuzzy_expanded || {});
@@ -599,7 +670,7 @@
       if (!data.items || !data.items.length) {
         $("hitList").innerHTML = `
           <div class="state-box">
-            没有找到匹配的字幕条目。可以尝试缩短关键词、开启“同音/别称模糊扩展”或切换至“全部成员”。
+            没有找到匹配的字幕条目。可以尝试缩短关键词、开启“同音/别称模糊扩展”或切换至“全部直播间”与“全部发言人”。
           </div>
         `;
         return;
@@ -614,19 +685,21 @@
           if (it.speaker_name === "其他/原声") {
             speakerBadge = `<span class="badge badge-speaker-other" title="声纹判定为非本库 6 位成员人声（如电影/动画/游戏原声或嘉宾）">声纹: 其他/原声</span>`;
           } else if (it.speaker_name === it.up_name) {
-            speakerBadge = `<span class="badge badge-speaker-ok" title="声纹确认本人发言（置信度 ${pct}%）">声纹: 本人 ✓</span>`;
+            speakerBadge = `<span class="badge badge-speaker-ok" title="声纹确认本人发言（置信度 ${pct}%）">发言: ${esc(it.speaker_name)} ✓</span>`;
           } else {
             const firstSp = String(it.speaker_name).split("+")[0];
             const st = getTheme(firstSp);
             speakerBadge = `<span class="badge badge-speaker" style="--sp-color:${st.color};--sp-bg:${st.bg};--sp-ink:${st.ink};" title="声纹识别实际发言人（置信度 ${pct}%）">发言: ${esc(it.speaker_name)}</span>`;
           }
+        } else if (it.scene_type === "solo") {
+          speakerBadge = `<span class="badge badge-speaker-solo" title="单播场次默认发言人为直播间本人">发言: ${esc(it.up_name)} (单播默认)</span>`;
         }
         return `
           <article class="hit-card" data-up="${esc(it.up_name)}" style="--m-color:${t.color};--m-bg:${t.bg};--m-ink:${t.ink};">
             <div class="hit-meta">
-              <span class="badge badge-member">
+              <span class="badge badge-member" title="录播所属直播间">
                 <span class="color-dot" style="background:${t.color};"></span>
-                ${esc(it.up_name)}
+                ${esc(it.up_name)}直播间
               </span>
               <span class="badge badge-scene">${esc(sceneName)}</span>
               ${speakerBadge}
@@ -782,12 +855,12 @@
     $("bvidFilter").value = "";
     $("sortFilter").value = "date_desc";
     $("fuzzyToggle").checked = true;
-    const spToggle = $("speakerFilterToggle");
-    if (spToggle) spToggle.checked = false;
     state.selectedUps.clear();
+    state.selectedSpeakers.clear();
     state.selectedScenes.clear();
     applyThemeAccent();
     renderMemberChips();
+    renderSpeakerChips();
     renderSceneChips();
     syncClearBtn();
     showLandingMode();
@@ -842,7 +915,7 @@
       });
     }
 
-    ["dateFrom", "dateTo", "sortFilter", "pageSizeFilter", "fuzzyToggle", "speakerFilterToggle"].forEach((id) => {
+    ["dateFrom", "dateTo", "sortFilter", "pageSizeFilter", "fuzzyToggle"].forEach((id) => {
       const el = $(id);
       if (el) {
         el.addEventListener("change", () => {
@@ -895,6 +968,7 @@
     });
 
     renderMemberChips();
+    renderSpeakerChips();
     renderLandingStatsAndCards();
     renderAuthorAndGithub();
     updateSearchPlaceholder();
