@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import base64
 import io
+import os
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -18,7 +21,19 @@ from pydantic import BaseModel, Field
 
 from zhijiang_corpus.bilibili_client import BilibiliClient
 from zhijiang_corpus.clip_planner import plan_clip_job
-from zhijiang_corpus.config import VALID_SCENE_TYPES, load_config, save_cookie_to_env
+from zhijiang_corpus.cloud_ops import (
+    deploy_code_and_announcements,
+    get_asr_progress,
+    get_scene_edit_summary,
+    load_announcements_file,
+    load_cloud_config,
+    save_announcements_file,
+    save_cloud_config,
+    setup_ssh_key,
+    sync_database_to_cloud,
+    sync_scene_tags_to_cloud,
+)
+from zhijiang_corpus.config import PROJECT_ROOT, VALID_SCENE_TYPES, load_config, save_cookie_to_env
 from zhijiang_corpus.db import CorpusDB
 from zhijiang_corpus.ingest import ingest_bvids, ingest_from_up
 from zhijiang_corpus.scene_tagger import run_scene_tagging
@@ -56,6 +71,51 @@ class ClipPlanRequest(BaseModel):
     pad_after_sec: float = Field(default=1.5, ge=0.0, le=30.0)
     merge_gap_sec: float = Field(default=3.0, ge=0.0, le=60.0)
     output_name: str = Field(default="zhijiang_compilation.mp4")
+
+
+class CloudConfigRequest(BaseModel):
+    cloud_host: str = Field(min_length=1, description="例如 root@47.xx.xx.xx")
+    cloud_app_dir: str = Field(default="/opt/zhijiang")
+    public_url: str = Field(default="https://zjdb.mprlzy.top")
+    ingest_limit: int = Field(default=10, ge=1, le=500)
+
+
+class SshKeySetupRequest(BaseModel):
+    cloud_host: Optional[str] = None
+    ssh_password: str = Field(min_length=1, description="仅本次请求内存使用，绝不落盘")
+
+
+class CloudJobRequest(BaseModel):
+    mode: str = Field(
+        default="db_sync_only",
+        pattern="^(full_sync|db_sync_only|scene_tags_only|code_and_announcements)$",
+    )
+    ssh_password: Optional[str] = Field(default=None, description="未配置免密密钥时临时传入，绝不落盘")
+    ingest_limit: int = Field(default=10, ge=1, le=500)
+    run_asr: bool = Field(default=False, description="full_sync 时是否自动执行 GPU 补录")
+    also_publish_announcements: bool = Field(default=True, description="同步时一并发布本地公告")
+    only_locked_tags: bool = Field(default=True, description="scene_tags_only 时是否仅同步人工锁定标签")
+
+
+class AnnouncementItemModel(BaseModel):
+    id: str = ""
+    tag: str = "公告"
+    level: str = "info"
+    date: str = ""
+    pinned: bool = False
+    active: bool = True
+    content: str = ""
+
+
+class AnnouncementsSaveRequest(BaseModel):
+    items: List[AnnouncementItemModel] = Field(default_factory=list)
+
+
+class AsrStartRequest(BaseModel):
+    mode: str = Field(default="new_only", pattern="^(new_only|retranscribe_legacy)$")
+    processes: int = Field(default=1, ge=1, le=3)
+    batch_size: int = Field(default=8, ge=1, le=32)
+    limit: int = Field(default=0, ge=0, le=5000)
 
 
 def _normalize_cookie_input(raw: str) -> str:
@@ -287,5 +347,270 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
             merge_gap_sec=body.merge_gap_sec,
             output_name=body.output_name,
         )
+
+    # ── 云端运维、公告管理、纯标签同步与本地 GPU ASR 控制中心 ──
+    cloud_lock = threading.Lock()
+    cloud_state: Dict[str, Any] = {
+        "running": False,
+        "mode": "",
+        "logs": [],
+        "last_summary": "",
+        "last_error": "",
+        "last_finished_at": None,
+        "live_stats": None,
+    }
+
+    def _cloud_log(msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        with cloud_lock:
+            cloud_state["logs"].append(f"[{ts}] {msg}")
+            if len(cloud_state["logs"]) > 500:
+                cloud_state["logs"] = cloud_state["logs"][-500:]
+
+    @router.get("/cloud/config", summary="读取本地云端同步配置与免密密钥状态")
+    def api_get_cloud_config() -> Dict[str, Any]:
+        return load_cloud_config()
+
+    @router.post("/cloud/config", summary="保存云端服务器地址配置至本地 .cloud_sync.env（不保存密码）")
+    def api_save_cloud_config(body: CloudConfigRequest) -> Dict[str, Any]:
+        return save_cloud_config(
+            cloud_host=body.cloud_host,
+            cloud_app_dir=body.cloud_app_dir,
+            public_url=body.public_url,
+            ingest_limit=body.ingest_limit,
+        )
+
+    @router.post("/cloud/setup-ssh-key", summary="一键配置本机 SSH 免密密钥到云端（密码仅内存使用一次）")
+    def api_setup_ssh_key(body: SshKeySetupRequest) -> Dict[str, Any]:
+        conf = load_cloud_config()
+        target_host = (body.cloud_host or conf.get("cloud_host") or "").strip()
+        if not target_host:
+            raise HTTPException(status_code=400, detail="请先填写云端服务器地址")
+        logs: List[str] = []
+        try:
+            res = setup_ssh_key(target_host, body.ssh_password, logs.append)
+            return {**res, "logs": logs, "config": load_cloud_config()}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.post("/cloud/run", summary="在后台执行云端同步 / 纯标签同步 / 仅发布代码与公告")
+    def api_run_cloud_job(body: CloudJobRequest) -> Dict[str, Any]:
+        conf = load_cloud_config()
+        if not conf.get("cloud_host"):
+            raise HTTPException(status_code=400, detail="请先在上方配置并保存云端服务器地址")
+        with cloud_lock:
+            if cloud_state["running"]:
+                raise HTTPException(status_code=409, detail="当前已有云端同步任务正在运行，请稍候")
+            cloud_state["running"] = True
+            cloud_state["mode"] = body.mode
+            cloud_state["logs"] = []
+            cloud_state["last_summary"] = ""
+            cloud_state["last_error"] = ""
+
+        # 密码仅留在局部变量供本线程一次使用，完成后立刻丢弃
+        mem_pwd = body.ssh_password
+
+        def _worker() -> None:
+            try:
+                if body.mode == "code_and_announcements":
+                    res = deploy_code_and_announcements(conf, mem_pwd, _cloud_log)
+                    summary = "线上代码与公告发布完成"
+                elif body.mode == "scene_tags_only":
+                    res = sync_scene_tags_to_cloud(
+                        db,
+                        conf,
+                        mem_pwd,
+                        only_locked=body.only_locked_tags,
+                        also_publish_announcements=body.also_publish_announcements,
+                        log_cb=_cloud_log,
+                    )
+                    ap = res.get("applied") or {}
+                    summary = (
+                        f"纯标签同步完成：更新 {ap.get('parts_updated', 0)} 个分P / "
+                        f"{ap.get('bvids_updated', 0)} 场直播"
+                    )
+                else:
+                    res = sync_database_to_cloud(
+                        db,
+                        conf,
+                        mem_pwd,
+                        run_ingest=(body.mode == "full_sync"),
+                        run_asr=(body.mode == "full_sync" and body.run_asr),
+                        ingest_limit=body.ingest_limit,
+                        also_publish_announcements=body.also_publish_announcements,
+                        log_cb=_cloud_log,
+                    )
+                    ap = res.get("applied") or {}
+                    summary = (
+                        f"数据库增量同步完成：写入 {ap.get('parts_applied', 0)} 个分P / "
+                        f"{ap.get('subtitles_inserted', 0):,} 条字幕"
+                    )
+                with cloud_lock:
+                    cloud_state["last_summary"] = summary
+                    cloud_state["live_stats"] = res.get("live_stats")
+            except Exception as exc:
+                _cloud_log(f"❌ 任务失败：{exc}")
+                with cloud_lock:
+                    cloud_state["last_error"] = str(exc)
+                    cloud_state["last_summary"] = f"失败：{exc}"
+            finally:
+                with cloud_lock:
+                    cloud_state["running"] = False
+                    cloud_state["last_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"started": True, "mode": body.mode}
+
+    @router.get("/cloud/status", summary="查询云端运维任务实时日志与状态")
+    def api_cloud_status() -> Dict[str, Any]:
+        with cloud_lock:
+            return dict(cloud_state)
+
+    @router.get("/announcements", summary="读取本地 config/announcements.json 全部公告（含未生效）")
+    def api_get_announcements() -> Dict[str, Any]:
+        return {"items": load_announcements_file()}
+
+    @router.put("/announcements", summary="保存公告列表至本地 config/announcements.json")
+    def api_save_announcements(body: AnnouncementsSaveRequest) -> Dict[str, Any]:
+        saved = save_announcements_file([it.model_dump() for it in body.items])
+        return {"saved": True, "items": saved}
+
+    @router.get("/scenes/summary", summary="统计人工锁定场景标签数量（今日与累计）")
+    def api_scenes_summary() -> Dict[str, Any]:
+        return get_scene_edit_summary(db)
+
+    # ── 本地 GPU ASR 补录/重录托管控制 ──
+    asr_lock = threading.Lock()
+    asr_procs: List[subprocess.Popen] = []
+    asr_state: Dict[str, Any] = {
+        "running": False,
+        "mode": "",
+        "logs": [],
+        "last_finished_at": None,
+    }
+
+    def _asr_log(msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        with asr_lock:
+            asr_state["logs"].append(f"[{ts}] {msg}")
+            if len(asr_state["logs"]) > 400:
+                asr_state["logs"] = asr_state["logs"][-400:]
+
+    @router.get("/asr/status", summary="查看本地 GPU ASR 补录/重录实时进度与托管状态")
+    def api_asr_status() -> Dict[str, Any]:
+        progress = get_asr_progress(db)
+        with asr_lock:
+            alive = [p for p in asr_procs if p.poll() is None]
+            asr_state["running"] = len(alive) > 0
+            state_copy = dict(asr_state)
+        return {"progress": progress, "job": state_copy}
+
+    @router.post("/asr/start", summary="从本地后台启动 GPU 语音补录或旧 ASR 高精度重录")
+    def api_asr_start(body: AsrStartRequest) -> Dict[str, Any]:
+        with asr_lock:
+            alive = [p for p in asr_procs if p.poll() is None]
+            if alive:
+                raise HTTPException(status_code=409, detail="当前已有本地后台托管的 ASR 任务正在运行")
+            asr_procs.clear()
+            asr_state["running"] = True
+            asr_state["mode"] = body.mode
+            asr_state["logs"] = []
+
+        env = os.environ.copy()
+        hf_dir = PROJECT_ROOT / "data" / "cache" / "huggingface"
+        tmp_dir = PROJECT_ROOT / "data" / "tmp_asr"
+        hf_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        env["HF_HOME"] = str(hf_dir)
+        env["TMP"] = str(tmp_dir)
+        env["TEMP"] = str(tmp_dir)
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        py = sys.executable
+        n_procs = max(1, min(3, int(body.processes)))
+
+        def _spawn_and_watch() -> None:
+            try:
+                _asr_log(f"启动 GPU ASR 任务：mode={body.mode}，进程数={n_procs}，batch_size={body.batch_size}")
+                local_procs: List[subprocess.Popen] = []
+                for idx in range(n_procs):
+                    cmd = [
+                        py,
+                        "-u",
+                        "run.py",
+                        "backfill-asr",
+                        "--limit",
+                        str(body.limit),
+                        "--batch-size",
+                        str(body.batch_size),
+                        "--beam-size",
+                        "2",
+                        "--chunk-length",
+                        "10",
+                        "--workers",
+                        "1",
+                        "--prefetch",
+                        "1",
+                    ]
+                    if body.mode == "retranscribe_legacy":
+                        cmd.append("--retranscribe-legacy-asr")
+                    if n_procs > 1:
+                        cmd.extend(["--shard-index", str(idx), "--shard-total", str(n_procs)])
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(PROJECT_ROOT),
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    local_procs.append(proc)
+                    with asr_lock:
+                        asr_procs.append(proc)
+
+                def _pump(p: subprocess.Popen, shard: int) -> None:
+                    if not p.stdout:
+                        return
+                    for line in p.stdout:
+                        txt = line.rstrip()
+                        if txt:
+                            prefix = f"[GPU#{shard + 1}] " if n_procs > 1 else ""
+                            _asr_log(f"{prefix}{txt}")
+
+                threads = [
+                    threading.Thread(target=_pump, args=(p, i), daemon=True)
+                    for i, p in enumerate(local_procs)
+                ]
+                for t in threads:
+                    t.start()
+                for p in local_procs:
+                    p.wait()
+                for t in threads:
+                    t.join(timeout=2)
+                _asr_log("GPU ASR 任务已结束。")
+            except Exception as exc:
+                _asr_log(f"❌ GPU ASR 任务异常：{exc}")
+            finally:
+                with asr_lock:
+                    asr_procs.clear()
+                    asr_state["running"] = False
+                    asr_state["last_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        threading.Thread(target=_spawn_and_watch, daemon=True).start()
+        return {"started": True, "mode": body.mode, "processes": n_procs}
+
+    @router.post("/asr/stop", summary="安全停止由本地后台启动的 GPU ASR 子进程")
+    def api_asr_stop() -> Dict[str, Any]:
+        stopped = 0
+        with asr_lock:
+            for p in asr_procs:
+                if p.poll() is None:
+                    p.terminate()
+                    stopped += 1
+        if stopped:
+            _asr_log(f"已发送停止信号给 {stopped} 个 GPU ASR 进程（已写入数据库的分P全部保留）。")
+        return {"stopped": stopped}
 
     return router

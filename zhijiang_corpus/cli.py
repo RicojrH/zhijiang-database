@@ -22,7 +22,7 @@ from .ingest import ingest_bvids, ingest_from_up, ingest_local_file, seed_demo_d
 from .normalizer import run_corpus_normalization
 from .scene_tagger import run_scene_tagging
 from .search import SearchQuery, SearchService
-from .sync_delta import apply_delta, build_manifest, export_delta
+from .sync_delta import apply_delta, apply_scene_tags, build_manifest, export_delta, export_scene_tags
 
 
 def _print_json(data: object) -> None:
@@ -446,6 +446,14 @@ def cmd_apply_delta(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_apply_scene_tags(args: argparse.Namespace) -> int:
+    cfg = load_config(db_path=args.db)
+    db = CorpusDB(cfg.db_path)
+    res = apply_scene_tags(db, args.patch_file)
+    _print_json(res)
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     cfg = load_config(db_path=args.db)
     enable_admin = not args.public_only
@@ -638,6 +646,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_adelta = sub.add_parser("apply-delta", help="在云端 SQLite WAL 模式下热应用增量补丁包（零停服）")
     p_adelta.add_argument("delta_file", help="增量补丁路径（.json.gz）")
     p_adelta.set_defaults(func=cmd_apply_delta)
+
+    p_atags = sub.add_parser("apply-scene-tags", help="在云端热应用纯场景标签轻量补丁（不触碰字幕正文）")
+    p_atags.add_argument("patch_file", help="标签补丁路径（.json.gz）")
+    p_atags.set_defaults(func=cmd_apply_scene_tags)
 
     p_serve = sub.add_parser("serve", help="启动后端 API 服务（默认本地含调试台，--public-only 为公网只读模式）")
     p_serve.add_argument("--host", default=None, help="监听地址（默认 127.0.0.1）")

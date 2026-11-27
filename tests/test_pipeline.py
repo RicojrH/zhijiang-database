@@ -296,6 +296,9 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     assert pub_client.get("/api/v1/members").status_code == 200
     assert pub_client.get("/debug").status_code == 404
     assert pub_client.get("/api/v1/admin/auth/status").status_code == 404
+    assert pub_client.get("/api/v1/admin/cloud/config").status_code == 404
+    assert pub_client.get("/api/v1/admin/announcements").status_code == 404
+    assert pub_client.get("/api/v1/admin/asr/status").status_code == 404
     assert pub_client.patch(
         "/api/v1/admin/videos/BV1DEMO000001/scene",
         json={"page": 1, "scene_type": "special"},
@@ -338,6 +341,26 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     plan = loc_client.post("/api/v1/admin/clips/plan", json={"subtitle_ids": [hit_id]}).json()
     assert plan["segment_count"] == 1
     assert plan["segments"][0]["subtitle_ids"] == [hit_id]
+
+    # 3. 本地运维中心接口：场景锁定汇总 + ASR 进度 + 纯标签轻量补丁导出与热应用
+    sc_sum = loc_client.get("/api/v1/admin/scenes/summary").json()
+    assert sc_sum["total_locked_bvids"] >= 1
+    asr_st = loc_client.get("/api/v1/admin/asr/status").json()
+    assert "progress" in asr_st and "job" in asr_st
+
+    from zhijiang_corpus.sync_delta import apply_scene_tags, export_scene_tags
+
+    cloud_db_file = tmp_path / "cloud_tags.db"
+    cloud_db = CorpusDB(cloud_db_file)
+    cloud_db.init_db()
+    seed_demo_data(cloud_db)
+    patch_file = tmp_path / "scene_tags.json.gz"
+    exp_tag = export_scene_tags(db, patch_file, only_locked=True)
+    assert exp_tag["parts_exported"] >= 1
+    ap_tag = apply_scene_tags(cloud_db, patch_file)
+    assert ap_tag["parts_updated"] == 1
+    assert cloud_db.get_video("BV1DEMO000001", 1)["scene_type"] == "special"
+    assert cloud_db.get_video("BV1DEMO000001", 1)["scene_locked"] == 1
 
 
 def test_asr_backfill_helpers(tmp_path: Path) -> None:

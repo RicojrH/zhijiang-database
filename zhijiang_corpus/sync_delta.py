@@ -279,3 +279,159 @@ def apply_delta(
             "db_size_mb": st["db_size_mb"],
         },
     }
+
+
+def export_scene_tags(
+    db: CorpusDB,
+    out_path: str | Path,
+    *,
+    only_locked: bool = True,
+) -> Dict[str, Any]:
+    """导出纯场景标签与可见性轻量补丁（仅数 KB，不携带任何字幕文本）."""
+    where_sql = "WHERE scene_locked = 1" if only_locked else ""
+    with db.session() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT bvid, page, scene_type, scene_confidence,
+                   scene_reason, scene_locked, is_visible, updated_at
+              FROM videos
+            {where_sql}
+             ORDER BY bvid ASC, page ASC
+            """
+        ).fetchall()
+
+    items = [
+        [
+            str(r["bvid"]),
+            int(r["page"]),
+            str(r["scene_type"] or "unknown"),
+            float(r["scene_confidence"] or 0.0),
+            str(r["scene_reason"] or ""),
+            int(r["scene_locked"] or 0),
+            int(r["is_visible"] if r["is_visible"] is not None else 1),
+            str(r["updated_at"] or ""),
+        ]
+        for r in rows
+    ]
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "type": "scene_tags",
+        "only_locked": only_locked,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "count": len(items),
+        "items": items,
+    }
+    raw_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    out.write_bytes(gzip.compress(raw_bytes, compresslevel=6))
+    return {
+        "only_locked": only_locked,
+        "parts_exported": len(items),
+        "bvids_exported": len({it[0] for it in items}),
+        "patch_size_kb": round(out.stat().st_size / 1024.0, 2),
+        "out_path": str(out),
+    }
+
+
+def apply_scene_tags(db: CorpusDB, patch_path: str | Path) -> Dict[str, Any]:
+    """在云端热更新场景标签与可见性（仅改有差异的行，不触碰字幕文本与 FTS5 索引）."""
+    p = Path(patch_path)
+    if not p.exists():
+        raise FileNotFoundError(f"找不到标签补丁文件: {p}")
+
+    raw = p.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    payload = json.loads(raw.decode("utf-8"))
+    items = payload.get("items") or []
+
+    parts_updated = 0
+    subtitles_updated = 0
+    bvids_touched: set[str] = set()
+
+    if items:
+        with db.session() as conn:
+            for it in items:
+                bvid = str(it[0])
+                page = int(it[1])
+                scene_type = str(it[2])
+                scene_conf = float(it[3])
+                scene_reason = str(it[4])
+                scene_locked = int(it[5])
+                is_visible = int(it[6])
+                updated_at = str(it[7]) if len(it) > 7 and it[7] else ""
+
+                cur = conn.execute(
+                    """
+                    SELECT scene_type, scene_locked, is_visible
+                      FROM videos
+                     WHERE bvid = ? AND page = ?
+                    """,
+                    (bvid, page),
+                ).fetchone()
+                if not cur:
+                    continue
+                if (
+                    str(cur["scene_type"] or "") == scene_type
+                    and int(cur["scene_locked"] or 0) == scene_locked
+                    and int(cur["is_visible"] if cur["is_visible"] is not None else 1) == is_visible
+                ):
+                    continue
+
+                conn.execute(
+                    """
+                    UPDATE videos
+                       SET scene_type = ?,
+                           scene_confidence = ?,
+                           scene_reason = ?,
+                           scene_locked = ?,
+                           is_visible = ?,
+                           updated_at = CASE WHEN ? != '' THEN ? ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END
+                     WHERE bvid = ? AND page = ?
+                    """,
+                    (
+                        scene_type,
+                        scene_conf,
+                        scene_reason,
+                        scene_locked,
+                        is_visible,
+                        updated_at,
+                        updated_at,
+                        bvid,
+                        page,
+                    ),
+                )
+                scur = conn.execute(
+                    """
+                    UPDATE subtitles
+                       SET scene_type = ?, is_visible = ?
+                     WHERE bvid = ? AND page = ?
+                    """,
+                    (scene_type, is_visible, bvid, page),
+                )
+                parts_updated += 1
+                subtitles_updated += max(0, int(scur.rowcount or 0))
+                bvids_touched.add(bvid)
+
+        conn = db.connect()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        finally:
+            conn.close()
+
+    st = db.get_stats()
+    return {
+        "status": "ok",
+        "parts_scanned": len(items),
+        "parts_updated": parts_updated,
+        "bvids_updated": len(bvids_touched),
+        "subtitles_updated": subtitles_updated,
+        "live_stats": {
+            "subtitles_total": st["subtitles_total"],
+            "video_parts_ok": st["video_parts_ok"],
+            "date_min": st["date_min"],
+            "date_max": st["date_max"],
+            "latest_updated_at": st.get("latest_updated_at"),
+        },
+    }

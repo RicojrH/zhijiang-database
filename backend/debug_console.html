@@ -140,6 +140,7 @@
     <button class="tab-btn active" id="tab-search" onclick="switchTab('search')">字幕检索验证</button>
     <button class="tab-btn" id="tab-videos" onclick="switchTab('videos')">已入库场次</button>
     <button class="tab-btn" id="tab-ingest" onclick="switchTab('ingest')">批量抓取与本地运维</button>
+    <button class="tab-btn" id="tab-cloud" onclick="switchTab('cloud')">云端同步 · 公告 · GPU补录</button>
   </div>
 </header>
 
@@ -337,6 +338,110 @@
       <div id="ingestLog" class="log-box">暂无抓取任务日志。</div>
     </div>
   </section>
+
+  <section id="view-cloud" class="hidden">
+    <div class="grid-2">
+      <div class="panel">
+        <h3 style="margin:0 0 8px;">1. 云端服务器连接（密码绝不落盘、绝不进 Git）</h3>
+        <div id="sshKeyStatus" style="font-size:12.5px;margin-bottom:10px;color:var(--muted);">正在检测本机 SSH 密钥状态...</div>
+        <div class="filters-row" style="margin-top:0;">
+          <label style="flex:1;min-width:190px;">服务器地址：<br />
+            <input id="cloudHost" type="text" placeholder="root@47.xx.xx.xx" style="width:100%;margin-top:4px;" />
+          </label>
+          <label style="flex:1;min-width:150px;">远程项目目录：<br />
+            <input id="cloudAppDir" type="text" value="/opt/zhijiang" style="width:100%;margin-top:4px;" />
+          </label>
+        </div>
+        <div class="filters-row">
+          <label style="flex:1;min-width:210px;">公开站点域名：<br />
+            <input id="cloudPublicUrl" type="text" value="https://zjdb.mprlzy.top" style="width:100%;margin-top:4px;" />
+          </label>
+          <label style="width:110px;">默认抓新场数：<br />
+            <input id="cloudIngestLimit" type="number" value="10" min="1" max="500" style="width:100%;margin-top:4px;" />
+          </label>
+        </div>
+        <div class="filters-row">
+          <label style="flex:1;min-width:220px;">临时 SSH 密码（仅本次内存使用；配置免密后可留空）：<br />
+            <input id="cloudSshPwd" type="password" placeholder="已配置免密密钥时无需填写" style="width:100%;margin-top:4px;" />
+          </label>
+        </div>
+        <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;">
+          <button class="btn sec" onclick="saveCloudConfig()">保存服务器地址</button>
+          <button class="btn" onclick="setupSshKey()">一键配置 SSH 免密登录</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 style="margin:0 0 8px;">2. 一键云端同步中心</h3>
+        <div id="sceneEditSummaryBox" style="font-size:12.5px;color:var(--muted);margin-bottom:10px;">正在统计人工修正的场景标签...</div>
+        <div class="filters-row" style="margin-top:0;">
+          <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
+            <input id="optSyncAnn" type="checkbox" checked /> 同步时顺带发布下方站点公告
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
+            <input id="optFullRunAsr" type="checkbox" checked /> 完整追新时自动跑 GPU 补录
+          </label>
+        </div>
+        <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;">
+          <button class="btn" onclick="runCloudJob('scene_tags_only')" title="仅更新场景标签与锁定状态，几 KB 秒传，不碰字幕正文与正在跑的 ASR">仅同步场景标签变动（极速）</button>
+          <button class="btn sec" onclick="runCloudJob('code_and_announcements')" title="仅拉代码、发布公告并重启线上服务，绝不改云端数据库">仅发布代码与公告</button>
+          <button class="btn sec" onclick="runCloudJob('db_sync_only')" title="跳过抓取，直接增量比对并热同步本地与云端差异数据">仅增量同步数据库差异</button>
+          <button class="btn" style="background:#059669;border-color:#059669;" onclick="runCloudJob('full_sync')" title="抓新回放 → 补录 → 场景初筛 → 增量热同步到线上">完整一键更新并同步上云</button>
+        </div>
+        <div id="cloudStatusText" style="margin-top:10px;font-size:12.5px;color:var(--muted);">空闲</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <b>云端同步实时日志</b>
+        <button class="btn sec" style="padding:4px 10px;font-size:12px;" onclick="pollCloudStatus()">刷新日志</button>
+      </div>
+      <div id="cloudLog" class="log-box">暂无云端同步日志。</div>
+    </div>
+
+    <div class="panel">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;">
+        <div>
+          <h3 style="margin:0;">3. 站点公告与更新动态管理（config/announcements.json）</h3>
+          <span style="font-size:12px;color:var(--muted);">在线编辑、增删、置顶或隐藏首页公告；点击「保存并立即发布」3 秒生效于公网首页。</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          <button class="btn sec" style="padding:6px 12px;font-size:13px;" onclick="insertSceneFixAnnouncement()">+ 一键插入今日标签修正变动</button>
+          <button class="btn sec" style="padding:6px 12px;font-size:13px;" onclick="addAnnouncementRow()">+ 新增公告</button>
+          <button class="btn sec" style="padding:6px 12px;font-size:13px;" onclick="saveAnnouncements(false)">仅保存到本地</button>
+          <button class="btn" style="padding:6px 12px;font-size:13px;" onclick="saveAnnouncements(true)">保存并立即发布到线上</button>
+        </div>
+      </div>
+      <div id="annEditorList" style="display:flex;flex-direction:column;gap:10px;"></div>
+    </div>
+
+    <div class="panel">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;">
+        <div>
+          <h3 style="margin:0;">4. 本地 GPU 语音识别（ASR）控制台</h3>
+          <span style="font-size:12px;color:var(--muted);">查看实时重录/补录进度，或直接从本后台启停本地 RTX GPU 识别任务（支持断点续跑）。</span>
+        </div>
+        <button class="btn sec" style="padding:5px 12px;font-size:12.5px;" onclick="pollAsrStatus()">刷新实时进度</button>
+      </div>
+      <div id="asrProgressBox" style="font-size:13px;margin-bottom:10px;padding:10px 12px;background:#f8fafc;border:1px solid var(--border);border-radius:8px;">正在读取本地数据库 ASR 进度...</div>
+      <div class="filters-row" style="margin-top:0;margin-bottom:10px;">
+        <label>并行 GPU 进程数：
+          <select id="asrProcs">
+            <option value="1">1 进程（省显存）</option>
+            <option value="2" selected>2 进程（推荐双并发）</option>
+          </select>
+        </label>
+        <label>Batch Size：
+          <input id="asrBatch" type="number" value="8" min="1" max="32" style="width:72px;" />
+        </label>
+        <button class="btn sec" id="btnAsrNew" onclick="startAsrJob('new_only')">补录无字幕新分P</button>
+        <button class="btn" id="btnAsrRetrans" onclick="startAsrJob('retranscribe_legacy')">启动旧ASR高精度重录（断点续跑）</button>
+        <button class="btn sec" style="color:#dc2626;border-color:#fca5a5;" onclick="stopAsrJob()">安全停止后台托管任务</button>
+      </div>
+      <div id="asrLog" class="log-box" style="max-height:220px;">暂无由本后台启动的 ASR 任务日志（若你在外部命令行启动了重录，上方进度条仍会实时同步数据库进度）。</div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -348,6 +453,10 @@ let videoPage = 1;
 let videoTotalPages = 0;
 let qrTimer = null;
 let ingestTimer = null;
+let cloudTimer = null;
+let asrTimer = null;
+let annItems = [];
+let sceneSummary = { today_locked_bvids: 0, today_locked_parts: 0, total_locked_bvids: 0, total_locked_parts: 0 };
 
 function hasQuery() {
   return Boolean(
@@ -387,12 +496,13 @@ function copyText(text, btn) {
 }
 
 function switchTab(tab) {
-  for (const name of ['search', 'videos', 'ingest']) {
+  for (const name of ['search', 'videos', 'ingest', 'cloud']) {
     document.getElementById('view-' + name).classList.toggle('hidden', name !== tab);
     document.getElementById('tab-' + name).classList.toggle('active', name === tab);
   }
   if (tab === 'videos') loadVideos(videoPage || 1);
   if (tab === 'ingest') { checkAuth(); pollIngestStatus(); }
+  if (tab === 'cloud') { loadCloudPanel(); }
 }
 
 function toggleUp(el) {
@@ -718,6 +828,273 @@ async function pollIngestStatus() {
   }
   await loadStats();
   if (!st.running && ingestTimer) { clearInterval(ingestTimer); ingestTimer = null; runSearch(0); }
+}
+
+async function loadCloudPanel() {
+  await Promise.all([
+    loadCloudConfig(),
+    loadSceneSummary(),
+    loadAnnouncementsEditor(),
+    pollCloudStatus(),
+    pollAsrStatus()
+  ]);
+}
+
+async function loadCloudConfig() {
+  const r = await fetch('/api/v1/admin/cloud/config');
+  const c = await r.json();
+  document.getElementById('cloudHost').value = c.cloud_host || '';
+  document.getElementById('cloudAppDir').value = c.cloud_app_dir || '/opt/zhijiang';
+  document.getElementById('cloudPublicUrl').value = c.public_url || 'https://zjdb.mprlzy.top';
+  document.getElementById('cloudIngestLimit').value = c.ingest_limit || 10;
+  const el = document.getElementById('sshKeyStatus');
+  if (c.has_ssh_key) {
+    el.innerHTML = `<span style="color:var(--ok);font-weight:600;">✅ 已检测到本机 SSH 密钥（${esc(c.ssh_key_path)}），同步通常无需填写密码。</span>`;
+  } else {
+    el.innerHTML = `<span style="color:var(--warn);font-weight:600;">⚠️ 尚未配置 SSH 免密密钥：请输入一次 SSH 密码后点击「一键配置 SSH 免密登录」，以后点按钮直接同步。</span>`;
+  }
+}
+
+async function saveCloudConfig() {
+  const body = {
+    cloud_host: document.getElementById('cloudHost').value.trim(),
+    cloud_app_dir: document.getElementById('cloudAppDir').value.trim() || '/opt/zhijiang',
+    public_url: document.getElementById('cloudPublicUrl').value.trim() || 'https://zjdb.mprlzy.top',
+    ingest_limit: parseInt(document.getElementById('cloudIngestLimit').value || '10', 10)
+  };
+  const r = await fetch('/api/v1/admin/cloud/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '保存失败'); return; }
+  await loadCloudConfig();
+  alert('云端服务器地址已保存到本地 .cloud_sync.env（不保存密码、不上传 Git）');
+}
+
+async function setupSshKey() {
+  const host = document.getElementById('cloudHost').value.trim();
+  const pwd = document.getElementById('cloudSshPwd').value;
+  if (!host) { alert('请先填写服务器地址'); return; }
+  if (!pwd) { alert('首次配置免密登录需要输入一次服务器 SSH 密码'); return; }
+  await saveCloudConfigSilent();
+  document.getElementById('cloudStatusText').textContent = '正在配置本机 SSH 免密密钥到云端...';
+  const r = await fetch('/api/v1/admin/cloud/setup-ssh-key', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ cloud_host: host, ssh_password: pwd })
+  });
+  const data = await r.json();
+  if (!r.ok) {
+    document.getElementById('cloudStatusText').textContent = '免密配置失败：' + (data.detail || '未知错误');
+    alert('配置免密失败：' + (data.detail || '请检查密码或网络'));
+    return;
+  }
+  document.getElementById('cloudSshPwd').value = '';
+  document.getElementById('cloudLog').textContent = (data.logs || []).join('\n');
+  document.getElementById('cloudStatusText').textContent = 'SSH 免密登录已生效！';
+  await loadCloudConfig();
+  alert('SSH 免密登录配置成功！以后直接点按钮同步，不用再输密码了。');
+}
+
+async function saveCloudConfigSilent() {
+  const host = document.getElementById('cloudHost').value.trim();
+  if (!host) return;
+  await fetch('/api/v1/admin/cloud/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      cloud_host: host,
+      cloud_app_dir: document.getElementById('cloudAppDir').value.trim() || '/opt/zhijiang',
+      public_url: document.getElementById('cloudPublicUrl').value.trim() || 'https://zjdb.mprlzy.top',
+      ingest_limit: parseInt(document.getElementById('cloudIngestLimit').value || '10', 10)
+    })
+  });
+}
+
+async function loadSceneSummary() {
+  const r = await fetch('/api/v1/admin/scenes/summary');
+  sceneSummary = await r.json();
+  document.getElementById('sceneEditSummaryBox').innerHTML =
+    `今日已手动锁定：<b>${sceneSummary.today_locked_bvids}</b> 场直播（${sceneSummary.today_locked_parts} 个分P）｜ ` +
+    `累计人工锁定：<b>${sceneSummary.total_locked_bvids}</b> 场直播（${sceneSummary.total_locked_parts} 个分P）`;
+}
+
+async function runCloudJob(mode) {
+  await saveCloudConfigSilent();
+  const body = {
+    mode,
+    ssh_password: document.getElementById('cloudSshPwd').value || null,
+    ingest_limit: parseInt(document.getElementById('cloudIngestLimit').value || '10', 10),
+    run_asr: document.getElementById('optFullRunAsr').checked,
+    also_publish_announcements: document.getElementById('optSyncAnn').checked,
+    only_locked_tags: true
+  };
+  const r = await fetch('/api/v1/admin/cloud/run', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '启动云端任务失败'); return; }
+  pollCloudStatus();
+  if (cloudTimer) clearInterval(cloudTimer);
+  cloudTimer = setInterval(pollCloudStatus, 1500);
+}
+
+async function pollCloudStatus() {
+  const r = await fetch('/api/v1/admin/cloud/status');
+  const st = await r.json();
+  document.getElementById('cloudStatusText').textContent = st.running
+    ? `⏳ 正在执行 [${st.mode}] ...`
+    : (st.last_finished_at ? `上次执行（${st.last_finished_at}）：${st.last_summary || '完成'}` : '空闲');
+  if (st.logs && st.logs.length) {
+    const box = document.getElementById('cloudLog');
+    box.textContent = st.logs.join('\n');
+    box.scrollTop = box.scrollHeight;
+  }
+  if (!st.running && cloudTimer) {
+    clearInterval(cloudTimer);
+    cloudTimer = null;
+    loadStats();
+    loadSceneSummary();
+  }
+}
+
+async function loadAnnouncementsEditor() {
+  const r = await fetch('/api/v1/admin/announcements');
+  const data = await r.json();
+  annItems = data.items || [];
+  renderAnnouncementsEditor();
+}
+
+function renderAnnouncementsEditor() {
+  const wrap = document.getElementById('annEditorList');
+  if (!annItems.length) {
+    wrap.innerHTML = '<div style="font-size:13px;color:var(--muted);padding:10px 0;">暂无公告，点击右上角「+ 新增公告」添加。</div>';
+    return;
+  }
+  wrap.innerHTML = annItems.map((it, idx) => `
+    <div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:#fafafa;display:flex;flex-direction:column;gap:8px;">
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <input type="text" value="${esc(it.tag)}" onchange="annItems[${idx}].tag=this.value" placeholder="标签如：更新预告" style="width:110px;padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;" />
+        <select onchange="annItems[${idx}].level=this.value" style="padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;">
+          <option value="info" ${it.level==='info'?'selected':''}>蓝灰 (info/预告)</option>
+          <option value="change" ${it.level==='change'?'selected':''}>浅绿 (change/变动)</option>
+          <option value="warn" ${it.level==='warn'?'selected':''}>暖黄 (warn/维护)</option>
+        </select>
+        <input type="date" value="${esc(it.date)}" onchange="annItems[${idx}].date=this.value" style="padding:4px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;" />
+        <label style="font-size:12.5px;display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="checkbox" ${it.pinned?'checked':''} onchange="annItems[${idx}].pinned=this.checked" /> 置顶
+        </label>
+        <label style="font-size:12.5px;display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="checkbox" ${it.active!==false?'checked':''} onchange="annItems[${idx}].active=this.checked" /> 生效显示
+        </label>
+        <button class="btn sec" style="margin-left:auto;padding:3px 10px;font-size:12px;color:#dc2626;" onclick="annItems.splice(${idx},1);renderAnnouncementsEditor()">删除</button>
+      </div>
+      <input type="text" value="${esc(it.content)}" oninput="annItems[${idx}].content=this.value" placeholder="输入公告正文..." style="width:100%;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13.5px;" />
+    </div>
+  `).join('');
+}
+
+function addAnnouncementRow() {
+  const today = new Date().toISOString().slice(0, 10);
+  annItems.unshift({
+    id: `${today}-${Date.now()}`,
+    tag: '最近变动',
+    level: 'change',
+    date: today,
+    pinned: false,
+    active: true,
+    content: ''
+  });
+  renderAnnouncementsEditor();
+}
+
+async function insertSceneFixAnnouncement() {
+  await loadSceneSummary();
+  const today = new Date().toISOString().slice(0, 10);
+  const cnt = sceneSummary.today_locked_bvids || sceneSummary.total_locked_bvids || 0;
+  annItems.push({
+    id: `${today}-scene-fix-${Date.now()}`,
+    tag: '最近变动',
+    level: 'change',
+    date: today,
+    pinned: false,
+    active: true,
+    content: `手动修正了 ${cnt} 场直播的单播/双播/团播标签`
+  });
+  renderAnnouncementsEditor();
+}
+
+async function saveAnnouncements(publishNow) {
+  const r = await fetch('/api/v1/admin/announcements', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ items: annItems })
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '保存公告失败'); return; }
+  annItems = data.items || [];
+  renderAnnouncementsEditor();
+  if (publishNow) {
+    await runCloudJob('code_and_announcements');
+  } else {
+    alert('公告已保存到本地 config/announcements.json');
+  }
+}
+
+async function pollAsrStatus() {
+  const r = await fetch('/api/v1/admin/asr/status');
+  const data = await r.json();
+  const p = data.progress || {};
+  const j = data.job || {};
+  document.getElementById('asrProgressBox').innerHTML = `
+    <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
+      <span>无字幕待补录：<b>${p.no_subtitle_parts || 0}</b> 个分P（${p.no_subtitle_hours || 0} 小时）</span>
+      <span>旧ASR高精度重录：<b>${p.v2_asr_done || 0} / ${p.retrans_total || 0}</b> 个分P（按时长 <b>${p.retrans_pct_hours || 0}%</b>，剩 ${p.legacy_hours_remaining || 0} 小时）</span>
+      <span>后台托管状态：<b>${j.running ? '运行中 (' + esc(j.mode) + ')' : '空闲'}</b></span>
+    </div>
+    <div style="margin-top:8px;height:8px;background:#e5e7eb;border-radius:999px;overflow:hidden;">
+      <div style="height:100%;width:${Math.min(100, p.retrans_pct_hours || 0)}%;background:var(--primary);transition:width 0.3s;"></div>
+    </div>
+  `;
+  if (j.logs && j.logs.length) {
+    const box = document.getElementById('asrLog');
+    box.textContent = j.logs.join('\n');
+    box.scrollTop = box.scrollHeight;
+  }
+  if (!j.running && asrTimer) {
+    clearInterval(asrTimer);
+    asrTimer = null;
+  }
+}
+
+async function startAsrJob(mode) {
+  const body = {
+    mode,
+    processes: parseInt(document.getElementById('asrProcs').value || '2', 10),
+    batch_size: parseInt(document.getElementById('asrBatch').value || '8', 10),
+    limit: 0
+  };
+  const r = await fetch('/api/v1/admin/asr/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '启动 ASR 失败'); return; }
+  pollAsrStatus();
+  if (asrTimer) clearInterval(asrTimer);
+  asrTimer = setInterval(pollAsrStatus, 3000);
+}
+
+async function stopAsrJob() {
+  const r = await fetch('/api/v1/admin/asr/stop', { method: 'POST' });
+  const data = await r.json();
+  await pollAsrStatus();
+  alert(data.stopped ? `已安全停止 ${data.stopped} 个后台 GPU ASR 进程` : '当前没有由本后台启动的 ASR 进程（如在外部命令行启动请直接 Ctrl+C）');
 }
 
 document.getElementById('qInput').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(1); });
