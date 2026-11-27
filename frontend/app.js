@@ -14,12 +14,12 @@
   };
 
   const MEMBER_THEMES_DARK = {
-    "嘉然": { color: "#E799B0", bg: "rgba(231, 153, 176, 0.15)", ink: "#F4B8C9", fan: "嘉心糖", official: "嘉然今天吃什么" },
-    "贝拉": { color: "#DB7D74", bg: "rgba(219, 125, 116, 0.15)", ink: "#F0A39B", fan: "贝极星", official: "贝拉kira" },
-    "乃琳": { color: "#8798C8", bg: "rgba(135, 152, 200, 0.16)", ink: "#B3C1E8", fan: "奶淇琳", official: "乃琳Queen" },
-    "向晚": { color: "#9AC8E2", bg: "rgba(154, 200, 226, 0.15)", ink: "#B5DCF2", fan: "顶碗人", official: "向晚大魔王" },
-    "心宜": { color: "#E05C94", bg: "rgba(224, 92, 148, 0.16)", ink: "#F594BC", fan: "心球仪", official: "心宜不是心仪" },
-    "思诺": { color: "#9A7EE0", bg: "rgba(154, 126, 224, 0.16)", ink: "#C3B0F2", fan: "小海诺", official: "思诺snow" }
+    "嘉然": { color: "#EE9DB5", bg: "rgba(238, 157, 181, 0.13)", ink: "#F7C2D2", fan: "嘉心糖", official: "嘉然今天吃什么" },
+    "贝拉": { color: "#E6867D", bg: "rgba(230, 134, 125, 0.13)", ink: "#F5B4AD", fan: "贝极星", official: "贝拉kira" },
+    "乃琳": { color: "#8B9FD4", bg: "rgba(139, 159, 212, 0.14)", ink: "#C1CEF0", fan: "奶淇琳", official: "乃琳Queen" },
+    "向晚": { color: "#8EC9E8", bg: "rgba(142, 201, 232, 0.13)", ink: "#BCE2F7", fan: "顶碗人", official: "向晚大魔王" },
+    "心宜": { color: "#E45E96", bg: "rgba(228, 94, 150, 0.14)", ink: "#F8A1C6", fan: "心球仪", official: "心宜不是心仪" },
+    "思诺": { color: "#A084E8", bg: "rgba(160, 132, 232, 0.14)", ink: "#CBBAF5", fan: "小海诺", official: "思诺snow" }
   };
 
   const MEMBER_THEMES = MEMBER_THEMES_LIGHT;
@@ -132,7 +132,7 @@
     const dark = isDarkMode();
     const map = dark ? MEMBER_THEMES_DARK : MEMBER_THEMES_LIGHT;
     return map[upName] || (dark
-      ? { color: "#8798C8", bg: "rgba(135, 152, 200, 0.16)", ink: "#B3C1E8", fan: "枝江", official: upName || "" }
+      ? { color: "#849AD6", bg: "rgba(132, 154, 214, 0.16)", ink: "#C2D1F7", fan: "枝江", official: upName || "" }
       : { color: "#576690", bg: "#F1F3F8", ink: "#364369", fan: "枝江", official: upName || "" }
     );
   }
@@ -217,7 +217,7 @@
 
     const allActive = state.selectedUps.size === 0 ? "active" : "";
     const allChipStyle = isDarkMode()
-      ? "--chip-color:#8798C8;--chip-bg:rgba(135,152,200,0.16);--chip-ink:#EEF1F8;"
+      ? "--chip-color:#849AD6;--chip-bg:rgba(132,154,214,0.16);--chip-ink:#D4E0FC;"
       : "--chip-color:#576690;--chip-bg:#F1F3F8;--chip-ink:#1B2232;";
     const allBtn = `
       <span class="strip-label">直播间（可多选）</span>
@@ -228,7 +228,7 @@
     `;
     const memberBtns = members.map((m) => {
       const t = getTheme(m.up_name);
-      const color = m.color || t.color;
+      const color = isDarkMode() ? t.color : (m.color || t.color);
       const active = state.selectedUps.has(m.up_name) ? "active" : "";
       return `
         <button type="button" class="member-chip ${active}" data-up="${esc(m.up_name)}"
@@ -254,7 +254,7 @@
 
     const allActive = state.selectedSpeakers.size === 0 ? "active" : "";
     const allChipStyle = isDarkMode()
-      ? "--chip-color:#8798C8;--chip-bg:rgba(135,152,200,0.16);--chip-ink:#EEF1F8;"
+      ? "--chip-color:#849AD6;--chip-bg:rgba(132,154,214,0.16);--chip-ink:#D4E0FC;"
       : "--chip-color:#576690;--chip-bg:#F1F3F8;--chip-ink:#1B2232;";
     const allBtn = `
       <span class="strip-label">发言人（可多选）</span>
@@ -265,7 +265,7 @@
     `;
     const speakerBtns = members.map((m) => {
       const t = getTheme(m.up_name);
-      const color = m.color || t.color;
+      const color = isDarkMode() ? t.color : (m.color || t.color);
       const active = state.selectedSpeakers.has(m.up_name) ? "active" : "";
       return `
         <button type="button" class="member-chip ${active}" data-speaker="${esc(m.up_name)}"
@@ -474,7 +474,7 @@
 
     $("memberGrid").innerHTML = members.map((m) => {
       const t = getTheme(m.up_name);
-      const color = m.color || t.color;
+      const color = isDarkMode() ? t.color : (m.color || t.color);
       const stat = byUpMap[m.up_name];
       const partsText = stat ? `${formatNumber(stat.ok_parts)} 个分P` : "—";
       const linesText = stat ? `${formatNumber(stat.subtitle_lines)} 条字幕` : "—";
