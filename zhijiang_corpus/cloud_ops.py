@@ -346,24 +346,18 @@ def _restart_remote_service(client, log_cb: LogCallback) -> None:
         log_cb(f"[云端服务] {line}")
 
 
-def _pull_remote_code_and_check_py(client, app_dir: str) -> bool:
-    """在云端执行 git pull，返回是否有后端 .py 代码变动（有变动时应自动重启 API 进程，避免前后端版本错配）."""
+def _pull_remote_code(client, app_dir: str, log_cb: LogCallback) -> None:
+    """在云端拉取最新代码（保护 config/announcements.json 不冲突）."""
     cmd = (
         f"set -e; cd {app_dir}; "
-        "BEFORE=$(git rev-parse HEAD); "
         "git checkout -- config/announcements.json 2>/dev/null || true; "
-        "git pull --ff-only -q origin main; "
-        "AFTER=$(git rev-parse HEAD); "
-        "if [ \"$BEFORE\" != \"$AFTER\" ] && git diff --name-only \"$BEFORE\" \"$AFTER\" -- '*.py' | grep -q .; then "
-        "  echo 'PY_CHANGED=1'; "
-        "else "
-        "  echo 'PY_CHANGED=0'; "
-        "fi"
+        "git pull --ff-only origin main"
     )
     code, out, err = _exec_remote(client, cmd, timeout=60)
     if code != 0:
         raise RuntimeError(f"云端 git pull 失败: {err or out}")
-    return "PY_CHANGED=1" in out
+    for ln in out.strip().splitlines():
+        log_cb(f"[git] {ln}")
 
 
 def setup_ssh_key(cloud_host: str, password: str, log_cb: LogCallback) -> Dict[str, Any]:
@@ -494,9 +488,6 @@ def sync_scene_tags_to_cloud(
 
     client = _open_ssh_client(cloud_host, password=password)
     try:
-        log_cb("确保云端代码最新（含 apply-scene-tags 命令）...")
-        py_changed = _pull_remote_code_and_check_py(client, app_dir)
-
         sftp = client.open_sftp()
         try:
             remote_patch = "/tmp/zhijiang_scene_tags.json.gz"
@@ -508,7 +499,7 @@ def sync_scene_tags_to_cloud(
         finally:
             sftp.close()
 
-        log_cb("正在云端热更新场景标签（零停服、不动字幕文本）...")
+        log_cb("正在云端热更新场景标签（纯数据零停服、不拉代码不重启）...")
         code, out, err = _exec_remote(
             client,
             f"set -e; cd {app_dir}; .venv/bin/python run.py apply-scene-tags /tmp/zhijiang_scene_tags.json.gz && rm -f /tmp/zhijiang_scene_tags.json.gz",
@@ -521,9 +512,6 @@ def sync_scene_tags_to_cloud(
             f"✅ 云端标签热更新完成：实际变动 {apply_info.get('parts_updated', 0)} 个分P"
             f"（{apply_info.get('bvids_updated', 0)} 场直播），联动更新 {apply_info.get('subtitles_updated', 0):,} 条字幕标签。"
         )
-        if py_changed:
-            log_cb("检测到云端后端 Python 代码已更新，正在自动重启 API 服务以保持前后端版本一致...")
-            _restart_remote_service(client, log_cb)
     finally:
         client.close()
         patch_file.unlink(missing_ok=True)
@@ -609,7 +597,9 @@ def sync_database_to_cloud(
 
     client = _open_ssh_client(cloud_host, password=password)
     try:
-        py_changed = _pull_remote_code_and_check_py(client, app_dir)
+        if run_ingest:
+            log_cb("一键更新模式：正在拉取云端最新代码...")
+            _pull_remote_code(client, app_dir, log_cb)
         code, out, err = _exec_remote(
             client,
             f"set -e; cd {app_dir}; .venv/bin/python run.py sync-manifest",
@@ -657,8 +647,8 @@ def sync_database_to_cloud(
         else:
             log_cb("✅ 云端数据库已与本地 100% 一致，无需上传字幕补丁。")
 
-        if py_changed:
-            log_cb("检测到云端后端 Python 代码已更新，正在自动重启 API 服务以保持前后端版本一致...")
+        if run_ingest:
+            log_cb("一键更新模式：正在重启云端 API 服务以确保最新代码与前后端一致...")
             _restart_remote_service(client, log_cb)
     finally:
         client.close()
@@ -741,10 +731,9 @@ def sync_speakers_to_cloud(
     patch_file = TMP_SYNC_DIR / "speakers_patch.json.gz"
     patch_file.unlink(missing_ok=True)
 
-    log_cb(f"正在连接云端 {cloud_host} 拉取最新代码与远端声纹进度清单...")
+    log_cb(f"正在连接云端 {cloud_host} 拉取远端声纹进度清单（纯数据热同步，不拉代码不重启）...")
     client = _open_ssh_client(cloud_host, password=password)
     try:
-        py_changed = _pull_remote_code_and_check_py(client, app_dir)
         code, out, err = _exec_remote(
             client,
             f"set -e; cd {app_dir}; .venv/bin/python run.py sync-manifest",
@@ -789,10 +778,6 @@ def sync_speakers_to_cloud(
             )
         else:
             log_cb("✅ 云端声纹标注已与本地完全一致，无需上传。")
-
-        if py_changed:
-            log_cb("检测到云端后端 Python 代码已更新，正在自动重启 API 服务以保持前后端版本一致...")
-            _restart_remote_service(client, log_cb)
     finally:
         client.close()
         patch_file.unlink(missing_ok=True)

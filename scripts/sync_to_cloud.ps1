@@ -105,18 +105,45 @@ if (-not $SyncOnly -and -not $SkipIngest) {
     Write-Host "`n==> [1-3/4] 已跳过本地抓取，直接比对并同步本地与云端的差异数据..." -ForegroundColor DarkGray
 }
 
-# ── 第 2 步：远程清单比对 + 生成增量补丁包（仅几百 KB ~ 几 MB） ──
-Write-Host "`n==> [4/4] 拉取云端数据清单并计算极速增量补丁..." -ForegroundColor Cyan
+# ── 第 2 步：远程拉取最新代码 + 清单比对 + 生成增量补丁包（字幕 + 声纹） ──
+Write-Host "`n==> [4/4] 拉取云端最新代码与数据清单，计算极速增量补丁..." -ForegroundColor Cyan
 $ManifestFile = Join-Path $Root "data\tmp_asr\remote_manifest.json"
 $DeltaFile    = Join-Path $Root "data\tmp_asr\zhijiang_delta.json.gz"
-Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile
+$SpeakersFile = Join-Path $Root "data\tmp_asr\zhijiang_speakers.json.gz"
+Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile, $SpeakersFile
 
-# 先确保云端代码已包含最新增量同步命令，再拉取清单
-$RemoteManifestJson = & ssh $CloudHost "cd $CloudAppDir && git pull --ff-only -q && .venv/bin/python run.py sync-manifest"
+# 先拉取云端最新代码（保护公告文件），并在一键更新时平滑重启云端服务（-SyncOnly 纯同步模式不拉代码也不重启）
+if (-not $SyncOnly) {
+    $PullAndRestartCmd = @"
+set -e
+cd $CloudAppDir
+git checkout -- config/announcements.json 2>/dev/null || true
+git pull --ff-only -q origin main
+SVC=`$(systemctl list-unit-files --type=service --no-legend | awk '{print `$1}' | grep -iE 'zhijiang|zjdb' | head -n 1 || true)
+if [ -n "`$SVC" ]; then
+  echo "[remote] 正在重启 `$SVC ..." >&2
+  systemctl restart "`$SVC"
+  sleep 1
+  echo "[remote] 服务状态: `$(systemctl is-active "`$SVC")" >&2
+fi
+.venv/bin/python run.py sync-manifest
+"@
+    $PullAndRestartCmd = $PullAndRestartCmd -replace "`r`n", "`n"
+    $RemoteManifestJson = & ssh $CloudHost $PullAndRestartCmd
+} else {
+    $RemoteManifestJson = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py sync-manifest"
+}
 if ($LASTEXITCODE -ne 0) {
     throw "SSH 拉取云端清单失败，请检查网络连接或服务器密码/密钥。"
 }
 [System.IO.File]::WriteAllText($ManifestFile, ($RemoteManifestJson -join "`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+# 同步本地站点公告（若存在）
+$AnnFile = Join-Path $Root "config\announcements.json"
+if (Test-Path $AnnFile) {
+    $null = Get-Content $AnnFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    & scp -q $AnnFile "${CloudHost}:${CloudAppDir}/config/announcements.json"
+}
 
 $ExportOut = & $Py run.py export-delta --remote-manifest $ManifestFile --out $DeltaFile
 if ($LASTEXITCODE -ne 0) { throw "本地生成增量补丁失败。" }
@@ -126,23 +153,41 @@ Write-Host ("    本地分P: {0} | 云端分P: {1} | 需同步分P: {2}（新增
     $ExportInfo.local_parts, $ExportInfo.remote_parts, $ExportInfo.parts_changed, `
     $ExportInfo.parts_new, $ExportInfo.parts_updated, $ExportInfo.subtitles_exported, $ExportInfo.delta_size_kb) -ForegroundColor White
 
-if ([int]$ExportInfo.parts_changed -eq 0) {
-    Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile
-    Write-Host "`n[OK] 云端数据库已与本地 100% 一致，无需上传任何数据！" -ForegroundColor Green
-    exit 0
+$ApplyInfo = [pscustomobject]@{ parts_applied = 0; subtitles_inserted = 0 }
+if ([int]$ExportInfo.parts_changed -gt 0) {
+    # ── 第 3 步：秒传小补丁到服务器并 WAL 热写入（零停服） ──
+    Write-Host "`n    正在上传增量字幕补丁 ($($ExportInfo.delta_size_kb) KB) 到 $CloudHost ..." -ForegroundColor Cyan
+    & scp $DeltaFile "${CloudHost}:/tmp/zhijiang_delta.json.gz"
+    if ($LASTEXITCODE -ne 0) { throw "SCP 上传补丁失败。" }
+
+    Write-Host "    正在云端热合并入库并增量更新 FTS5 索引（不中断公网访问）..." -ForegroundColor Cyan
+    $ApplyOut = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py apply-delta /tmp/zhijiang_delta.json.gz && rm -f /tmp/zhijiang_delta.json.gz"
+    if ($LASTEXITCODE -ne 0) { throw "云端合并补丁失败。" }
+    $ApplyInfo = ($ApplyOut -join "`n") | ConvertFrom-Json
+} else {
+    Write-Host "    [OK] 字幕库已与云端 100% 一致，无需上传字幕补丁。" -ForegroundColor Green
 }
 
-# ── 第 3 步：秒传小补丁到香港服务器并 WAL 热写入（零停服） ──
-Write-Host "`n    正在上传增量补丁 ($($ExportInfo.delta_size_kb) KB) 到 $CloudHost ..." -ForegroundColor Cyan
-& scp $DeltaFile "${CloudHost}:/tmp/zhijiang_delta.json.gz"
-if ($LASTEXITCODE -ne 0) { throw "SCP 上传补丁失败。" }
+# 检查并增量同步声纹发言人标注补丁（零 FTS5 重建）
+$SpkExportOut = & $Py -c "import json; from pathlib import Path; from zhijiang_corpus.config import load_config; from zhijiang_corpus.db import CorpusDB; from zhijiang_corpus.sync_delta import export_speakers; cfg=load_config(); db=CorpusDB(cfg.db_path); rm=json.loads(Path(r'$ManifestFile').read_text(encoding='utf-8')); print(json.dumps(export_speakers(db, Path(r'$SpeakersFile'), remote_manifest=rm), ensure_ascii=False))"
+if ($LASTEXITCODE -eq 0 -and $SpkExportOut) {
+    $SpkInfo = ($SpkExportOut -join "`n") | ConvertFrom-Json
+    if ([int]$SpkInfo.parts_exported -gt 0) {
+        Write-Host ("    发现新声纹标注：{0} 个分P / {1:N0} 条发言人标签（{2} KB），正在热同步..." -f `
+            $SpkInfo.parts_exported, $SpkInfo.lines_exported, $SpkInfo.patch_size_kb) -ForegroundColor Cyan
+        & scp $SpeakersFile "${CloudHost}:/tmp/zhijiang_speakers.json.gz"
+        if ($LASTEXITCODE -ne 0) { throw "SCP 上传声纹补丁失败。" }
+        $SpkApplyOut = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py apply-speakers /tmp/zhijiang_speakers.json.gz && rm -f /tmp/zhijiang_speakers.json.gz"
+        if ($LASTEXITCODE -ne 0) { throw "云端应用声纹补丁失败。" }
+        $SpkApply = ($SpkApplyOut -join "`n") | ConvertFrom-Json
+        Write-Host ("    [OK] 云端声纹标注热写入完成：{0} 个分P / {1:N0} 条发言人标签。" -f `
+            $SpkApply.parts_applied, $SpkApply.lines_updated) -ForegroundColor Green
+    } else {
+        Write-Host "    [OK] 声纹发言人标注已与云端 100% 一致。" -ForegroundColor Green
+    }
+}
 
-Write-Host "    正在云端热合并入库并增量更新 FTS5 索引（不中断公网访问）..." -ForegroundColor Cyan
-$ApplyOut = & ssh $CloudHost "cd $CloudAppDir && .venv/bin/python run.py apply-delta /tmp/zhijiang_delta.json.gz && rm -f /tmp/zhijiang_delta.json.gz"
-if ($LASTEXITCODE -ne 0) { throw "云端合并补丁失败。" }
-$ApplyInfo = ($ApplyOut -join "`n") | ConvertFrom-Json
-
-Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile
+Remove-Item -Force -ErrorAction SilentlyContinue $ManifestFile, $DeltaFile, $SpeakersFile
 
 # ── 第 4 步：自动验收公网首页实时统计数据 ──
 Write-Host "`n========================================================" -ForegroundColor Green
