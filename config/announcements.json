@@ -1,13 +1,22 @@
 {
   "items": [
     {
-      "id": "2026-11-26-asr-retranscribe",
+      "id": "2026-11-27-asr-progress",
       "tag": "更新预告",
       "level": "info",
-      "date": "2026-11-26",
+      "date": "2026-11-27",
       "pinned": true,
       "active": true,
-      "content": "由ASR生成的部分字幕存在断句问题，目前正在重新推理生成，预计27日下午更新数据库，并同步到最新状态"
+      "content": "由ASR生成的部分字幕存在断句问题，目前正在重新推理生成（已完成约 51%，预计今日 15:30 左右完成并全量同步）"
+    },
+    {
+      "id": "2026-11-27-latest-replays",
+      "tag": "最近变动",
+      "level": "change",
+      "date": "2026-11-27",
+      "pinned": false,
+      "active": true,
+      "content": "已同步 11 月 26 日最新 2 场直播回放：嘉然《火鸡复仇计划》、乃琳《蝴蝶来过》（新增 2,549 条字幕）"
     }
   ]
 }
