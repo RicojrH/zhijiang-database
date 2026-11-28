@@ -924,12 +924,30 @@ def get_voiceprint_progress(db: CorpusDB) -> Dict[str, Any]:
         any_done = conn.execute(
             "SELECT COUNT(*) AS c, COALESCE(SUM(line_count), 0) AS lines FROM videos WHERE voiceprint_status = 'ok'"
         ).fetchone()
+        all_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total_parts,
+                   COALESCE(SUM(CASE WHEN voiceprint_status = 'ok' THEN 1 ELSE 0 END), 0) AS done_parts,
+                   COALESCE(SUM(CASE WHEN voiceprint_status != 'ok' THEN duration_sec ELSE 0 END), 0) AS rem_dur,
+                   COALESCE(SUM(duration_sec), 0) AS total_dur
+              FROM videos
+             WHERE subtitle_status = 'ok'
+               AND line_count > 0
+               AND duration_sec >= 15
+            """
+        ).fetchone()
     total_p = int(target_row["total_parts"] or 0)
     done_p = int(target_row["done_parts"] or 0)
     rem_p = max(0, total_p - done_p)
     total_dur = int(target_row["total_dur"] or 0)
     rem_dur = int(target_row["rem_dur"] or 0)
     pct = round((done_p / total_p) * 100.0, 1) if total_p > 0 else 100.0
+    all_total_p = int(all_row["total_parts"] or 0)
+    all_done_p = int(all_row["done_parts"] or 0)
+    all_rem_p = max(0, all_total_p - all_done_p)
+    all_rem_dur = int(all_row["rem_dur"] or 0)
+    all_total_dur = int(all_row["total_dur"] or 0)
+    all_pct = round((all_done_p / all_total_p) * 100.0, 1) if all_total_p > 0 else 100.0
     bank_ready = (
         (VOICEPRINT_CACHE_DIR / CAMP_MODEL_NAME).exists()
         and (VOICEPRINT_CACHE_DIR / WESP_MODEL_NAME).exists()
@@ -946,7 +964,12 @@ def get_voiceprint_progress(db: CorpusDB) -> Dict[str, Any]:
         "remaining_hours": round(rem_dur / 3600.0, 1),
         "total_hours": round(total_dur / 3600.0, 1),
         "pct_parts": pct,
+        "all_total_parts": all_total_p,
         "all_done_parts": int(any_done["c"] or 0),
+        "all_remaining_parts": all_rem_p,
+        "all_remaining_hours": round(all_rem_dur / 3600.0, 1),
+        "all_total_hours": round(all_total_dur / 3600.0, 1),
+        "all_pct_parts": all_pct,
         "all_done_lines": int(any_done["lines"] or 0),
         "model_ready": bank_ready,
         "cuda_available": cuda_ok,
