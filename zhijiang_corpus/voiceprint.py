@@ -1114,11 +1114,14 @@ def run_voiceprint_batch(
         finally:
             with alive_lock:
                 alive_pf[0] -= 1
-                if alive_pf[0] <= 0:
+                is_last = alive_pf[0] <= 0
+            if is_last:
+                while not stop_ev.is_set():
                     try:
-                        task_q.put(None, timeout=1.0)
+                        task_q.put(None, timeout=0.5)
+                        break
                     except queue.Full:
-                        pass
+                        continue
 
     pf_threads = [threading.Thread(target=_prefetch_worker, daemon=True) for _ in range(n_prefetch)]
     for t in pf_threads:

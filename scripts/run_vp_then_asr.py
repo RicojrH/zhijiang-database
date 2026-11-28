@@ -97,7 +97,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="声纹 -> ASR -> 标签复检 -> 增量多人声纹 -> 全量声纹编排脚本")
     parser.add_argument("--skip-initial-vp", action="store_true", help="跳过阶段 1 初始声纹，直接从阶段 2 ASR 开始")
     parser.add_argument("--vp-procs", type=int, default=3, help="声纹并行进程数（默认 3）")
-    parser.add_argument("--asr-procs", type=int, default=2, help="ASR 并行进程数（默认 2）")
+    parser.add_argument("--asr-procs", type=int, default=3, help="ASR 并行进程数（默认 3）")
+    parser.add_argument("--asr-prefetch", type=int, default=3, help="每 ASR 进程并发预取下载线程数（默认 3）")
+    parser.add_argument("--vp-prefetch", type=int, default=3, help="每声纹进程并发预取下载线程数（默认 3）")
     args = parser.parse_args()
 
     env = os.environ.copy()
@@ -133,22 +135,26 @@ def main() -> int:
             _cleanup_vp_tmp()
         time.sleep(3)
 
-    # 阶段 2：2 进程并行 GPU ASR 补录全部无字幕新分 P
+    # 阶段 2：多进程并行 GPU ASR 补录全部无字幕新分 P（含 1 次断流自动重试）
+    asr_base_cmd = [
+        "run.py", "backfill-asr",
+        "--limit", "0",
+        "--batch-size", "12",
+        "--beam-size", "1",
+        "--chunk-length", "10",
+        "--workers", "1",
+        "--prefetch", str(args.asr_prefetch),
+    ]
     try:
-        rc_asr = _run_sharded(
-            "ASR",
-            [
-                "run.py", "backfill-asr",
-                "--limit", "0",
-                "--batch-size", "12",
-                "--beam-size", "1",
-                "--chunk-length", "10",
-                "--workers", "1",
-                "--prefetch", "1",
-            ],
-            n_procs=args.asr_procs,
-            env=env,
-        )
+        rc_asr = _run_sharded("ASR", asr_base_cmd, n_procs=args.asr_procs, env=env)
+    finally:
+        _cleanup_asr_tmp()
+    time.sleep(2)
+    # 若存在偶发 B 站 CDN 断流导致的残留 no_subtitle 分 P，自动补跑 1 轮重试
+    try:
+        rc_asr_retry = _run_sharded("ASR-RETRY", asr_base_cmd, n_procs=min(2, args.asr_procs), env=env)
+        if rc_asr != 0 and rc_asr_retry == 0:
+            rc_asr = 0
     finally:
         _cleanup_asr_tmp()
     time.sleep(3)
@@ -169,7 +175,7 @@ def main() -> int:
                 "--batch-size", "64",
                 "--limit", "0",
                 "--threads", "4",
-                "--prefetch", "2",
+                "--prefetch", str(args.vp_prefetch),
             ],
             n_procs=args.vp_procs,
             env=env,
@@ -189,7 +195,7 @@ def main() -> int:
                 "--batch-size", "64",
                 "--limit", "0",
                 "--threads", "4",
-                "--prefetch", "2",
+                "--prefetch", str(args.vp_prefetch),
             ],
             n_procs=args.vp_procs,
             env=env,

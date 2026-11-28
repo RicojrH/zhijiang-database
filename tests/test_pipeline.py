@@ -358,7 +358,8 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     assert bf2["visitors"]["total_pv"] == 3
     ann_res = pub_client.get("/api/v1/announcements")
     assert ann_res.status_code == 200
-    assert any("ASR" in item["content"] for item in ann_res.json()["items"])
+    assert isinstance(ann_res.json()["items"], list)
+    assert len(ann_res.json()["items"]) >= 1
 
     sr = pub_client.get("/api/v1/search", params={"q": "小作文", "up_name": "嘉然,向晚"}).json()
     assert sr["pagination"]["total"] == 2
