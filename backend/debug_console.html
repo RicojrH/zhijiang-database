@@ -1196,6 +1196,8 @@ async function loadCloudPanel() {
     pollAsrStatus(),
     pollVpStatus()
   ]);
+  if (!asrTimer) asrTimer = setInterval(pollAsrStatus, 5000);
+  if (!vpTimer) vpTimer = setInterval(pollVpStatus, 5000);
 }
 
 async function loadCloudConfig() {
@@ -1408,14 +1410,24 @@ async function pollAsrStatus() {
   const data = await r.json();
   const p = data.progress || {};
   const j = data.job || {};
+  const noSubParts = Number(p.no_subtitle_parts || 0);
+  const v2Done = Number(p.v2_asr_done || 0);
+  const legRem = Number(p.legacy_asr_remaining || 0);
+  let barPct = Number(p.retrans_pct_hours || 0);
+  let barLabel = `旧ASR高精度重录：<b>${v2Done} / ${p.retrans_total || 0}</b> 个分P（按时长 <b>${p.retrans_pct_hours || 0}%</b>，剩 ${p.legacy_hours_remaining || 0} 小时）`;
+  if (legRem === 0 && noSubParts > 0) {
+    const totNew = v2Done + noSubParts;
+    barPct = totNew > 0 ? Math.round((v2Done / totNew) * 1000) / 10 : 0;
+    barLabel = `新分P ASR 补录总进度：<b>${v2Done} / ${totNew}</b> 个分P（<b>${barPct}%</b>，剩 ${noSubParts} 个 / ${p.no_subtitle_hours || 0} 小时）`;
+  }
   document.getElementById('asrProgressBox').innerHTML = `
     <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
-      <span>无字幕待补录：<b>${p.no_subtitle_parts || 0}</b> 个分P（${p.no_subtitle_hours || 0} 小时）</span>
-      <span>旧ASR高精度重录：<b>${p.v2_asr_done || 0} / ${p.retrans_total || 0}</b> 个分P（按时长 <b>${p.retrans_pct_hours || 0}%</b>，剩 ${p.legacy_hours_remaining || 0} 小时）</span>
+      <span>无字幕待补录：<b>${noSubParts}</b> 个分P（${p.no_subtitle_hours || 0} 小时）</span>
+      <span>${barLabel}</span>
       <span>后台托管状态：<b>${j.running ? '运行中 (' + esc(j.mode) + ')' : '空闲'}</b></span>
     </div>
     <div style="margin-top:8px;height:8px;background:#e5e7eb;border-radius:999px;overflow:hidden;">
-      <div style="height:100%;width:${Math.min(100, p.retrans_pct_hours || 0)}%;background:var(--primary);transition:width 0.3s;"></div>
+      <div style="height:100%;width:${Math.min(100, barPct)}%;background:var(--primary);transition:width 0.3s;"></div>
     </div>
   `;
   if (j.logs && j.logs.length) {
@@ -1425,9 +1437,6 @@ async function pollAsrStatus() {
   }
   if (j.running && !asrTimer) {
     asrTimer = setInterval(pollAsrStatus, 5000);
-  } else if (!j.running && asrTimer) {
-    clearInterval(asrTimer);
-    asrTimer = null;
   }
 }
 
@@ -1487,9 +1496,6 @@ async function pollVpStatus() {
   }
   if (j.running && !vpTimer) {
     vpTimer = setInterval(pollVpStatus, 5000);
-  } else if (!j.running && vpTimer) {
-    clearInterval(vpTimer);
-    vpTimer = null;
   }
 }
 
