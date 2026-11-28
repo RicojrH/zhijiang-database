@@ -8,6 +8,10 @@ from typing import Any, Dict, List, Optional, Sequence
 from .db import CorpusDB
 from .normalizer import build_fuzzy_fts_query
 
+# 第三方归档中无法区分具体所属直播间来源的场次标识：
+# 无论用户在「直播间」筛选器中选中哪位成员，这些记录都会一并纳入检索结果
+UNATTRIBUTED_UP_NAMES: tuple[str, ...] = ("A-SOUL", "未知", "", "unknown")
+
 
 @dataclass
 class SearchQuery:
@@ -97,11 +101,13 @@ class SearchService:
             cleaned_speakers = list(cleaned_ups)
             cleaned_ups = []
 
-        # 1) 直播间（录播所属频道）过滤：可与「发言人」独立 AND 组合
+        # 1) 直播间（录播所属频道）过滤：可与「发言人」独立 AND 组合；
+        #    无法区分直播间来源的第三方归档（如 A-SOUL）不管选谁都能搜到
         if cleaned_ups:
-            placeholders = ",".join("?" for _ in cleaned_ups)
+            effective_ups = list(dict.fromkeys([*cleaned_ups, *UNATTRIBUTED_UP_NAMES]))
+            placeholders = ",".join("?" for _ in effective_ups)
             where_clauses.append(f"s.up_name IN ({placeholders})")
-            params.extend(cleaned_ups)
+            params.extend(effective_ups)
 
         # 2) 发言人（声纹识别 + 单播默认本人）过滤
         if cleaned_speakers:
@@ -303,8 +309,10 @@ class SearchService:
         if not include_hidden:
             clauses.append("is_visible = 1")
         if up_name:
-            clauses.append("up_name = ?")
-            params.append(up_name.strip())
+            effective_ups = list(dict.fromkeys([up_name.strip(), *UNATTRIBUTED_UP_NAMES]))
+            placeholders = ",".join("?" for _ in effective_ups)
+            clauses.append(f"up_name IN ({placeholders})")
+            params.extend(effective_ups)
         if scene_type:
             clauses.append("scene_type = ?")
             params.append(scene_type.strip())

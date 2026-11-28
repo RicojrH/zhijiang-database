@@ -185,8 +185,6 @@
         <button class="chip" data-up="向晚" style="border-color:#9ac8e2;color:#225f80;" onclick="toggleUp(this)">向晚</button>
         <button class="chip" data-up="心宜" style="border-color:#c93773;color:#9d2256;" onclick="toggleUp(this)">心宜</button>
         <button class="chip" data-up="思诺" style="border-color:#7252c0;color:#513399;" onclick="toggleUp(this)">思诺</button>
-        <button class="chip" data-up="A-SOUL" style="border-color:#64748b;color:#334155;" onclick="toggleUp(this)">A-SOUL</button>
-        <button class="chip" data-up="珈乐" style="border-color:#b8a6d9;color:#5b4b8a;" onclick="toggleUp(this)">珈乐</button>
       </div>
       <div class="chips" id="speakerChips" style="margin-top:8px;">
         <span style="font-size:13px;color:var(--muted);">发言人：</span>
@@ -255,8 +253,6 @@
             <option value="向晚">向晚</option>
             <option value="心宜">心宜</option>
             <option value="思诺">思诺</option>
-            <option value="A-SOUL">A-SOUL</option>
-            <option value="珈乐">珈乐</option>
           </select>
         </label>
         <label>场景：
@@ -827,7 +823,7 @@ async function runSearch(page) {
   box.innerHTML = data.items.map(it => `
     <div class="card" id="card-${it.id}">
       <div class="card-meta">
-        <span class="badge up">${esc(it.up_name)}</span>
+        <span class="badge up">${esc((!it.up_name || it.up_name === 'A-SOUL' || it.up_name === 'unknown' || it.up_name === '未知') ? '未区分直播间' : it.up_name)}</span>
         <span class="badge scene">${esc(it.scene_type)}</span>
         <span style="display:inline-flex;align-items:center;gap:4px;">发言人：${window._renderSpeakerSelect(it.id, it.speaker_name)}</span>
         <span class="badge time">${esc(it.start_hms)} ~ ${esc(it.end_hms)}</span>

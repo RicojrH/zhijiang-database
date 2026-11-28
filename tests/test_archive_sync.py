@@ -115,3 +115,41 @@ def test_date_and_feishu_classification():
         "group",
         "2020-12-20",
     )
+
+
+def test_unattributed_live_room_matches_any_selected_member(tmp_path):
+    from zhijiang_corpus.db import CorpusDB, SubtitleRow, VideoRecord
+    from zhijiang_corpus.search import SearchQuery, SearchService
+
+    db = CorpusDB(tmp_path / "test_unattributed.db")
+    db.init_db()
+    db.save_video_and_subtitles(
+        VideoRecord(
+            bvid="BV1SHARED0001",
+            page=1,
+            up_name="A-SOUL",
+            pub_date="2023-02-05",
+            title="【A-SOUL小剧场】枝江上元夜",
+            subtitle_status="ok",
+            scene_type="group",
+        ),
+        [
+            SubtitleRow(
+                up_name="A-SOUL",
+                bvid="BV1SHARED0001",
+                page=1,
+                pub_date="2023-02-05",
+                start_sec=10.0,
+                end_sec=14.0,
+                content="枝江上元夜大家一起猜灯谜",
+                scene_type="group",
+            )
+        ],
+    )
+    svc = SearchService(db)
+    for member in ("嘉然", "贝拉", "乃琳", "向晚", "心宜", "思诺"):
+        res = svc.search(SearchQuery(q="猜灯谜", up_names=[member]))
+        assert res["pagination"]["total"] == 1
+        assert res["items"][0]["bvid"] == "BV1SHARED0001"
+        vids = svc.list_videos(up_name=member)
+        assert vids["total"] == 1

@@ -694,12 +694,17 @@
         } else if (it.scene_type === "solo") {
           speakerBadge = `<span class="badge badge-speaker-solo" title="单播场次默认发言人为直播间本人">发言: ${esc(it.up_name)} (单播默认)</span>`;
         }
+        const isUnattributedRoom = !it.up_name || it.up_name === "A-SOUL" || it.up_name === "unknown" || it.up_name === "未知";
+        const roomLabel = isUnattributedRoom ? "未区分直播间" : `${it.up_name}直播间`;
+        const roomTitle = isUnattributedRoom
+          ? "第三方归档录播，未区分具体所属直播间（任意直播间筛选下均可搜到）"
+          : "录播所属直播间";
         return `
           <article class="hit-card" data-up="${esc(it.up_name)}" style="--m-color:${t.color};--m-bg:${t.bg};--m-ink:${t.ink};">
             <div class="hit-meta">
-              <span class="badge badge-member" title="录播所属直播间">
+              <span class="badge badge-member" title="${esc(roomTitle)}">
                 <span class="color-dot" style="background:${t.color};"></span>
-                ${esc(it.up_name)}直播间
+                ${esc(roomLabel)}
               </span>
               <span class="badge badge-scene">${esc(sceneName)}</span>
               ${speakerBadge}
