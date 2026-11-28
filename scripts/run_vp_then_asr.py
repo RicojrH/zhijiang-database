@@ -1,7 +1,15 @@
-"""串行编排：先 2 进程并行执行声纹发言人标注，完成后自动 2 进程并行执行 GPU ASR 补录."""
+"""全自动串行编排：
+  1. [可选] 3 进程并行声纹标注（multi_and_watch）
+  2. 2 进程并行 GPU ASR 补录无字幕分 P
+  3. 专有名词纠错 + 全库场景标签复检（tag-scenes --only-unknown + 二创计画合集核对）
+  4. 3 进程并行声纹标注（先跑 ASR 后新产生的多人场次 / 电影电台回：--scope multi_and_watch）
+  5. 3 进程并行全量不重复声纹标注（剩余全部未标注场次：--scope all，绝不重复跑已 ok 场次）
+  6. 压缩优化 FTS5 索引与 WAL
+"""
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -37,7 +45,10 @@ def _cleanup_asr_tmp() -> None:
 def _run_sharded(label: str, base_args: List[str], n_procs: int, env: dict[str, str]) -> int:
     py = sys.executable
     procs: List[subprocess.Popen] = []
-    print(f"\n==================== [{time.strftime('%H:%M:%S')}] 启动 {label} ({n_procs} 进程并行) ====================", flush=True)
+    print(
+        f"\n==================== [{time.strftime('%H:%M:%S')}] 启动 {label} ({n_procs} 进程并行) ====================",
+        flush=True,
+    )
     for idx in range(n_procs):
         cmd = [py, "-u", *base_args, "--shard-index", str(idx), "--shard-total", str(n_procs)]
         proc = subprocess.Popen(
@@ -68,11 +79,27 @@ def _run_sharded(label: str, base_args: List[str], n_procs: int, env: dict[str, 
     rcs = [p.wait() for p in procs]
     for t in threads:
         t.join(timeout=5)
-    print(f"==================== [{time.strftime('%H:%M:%S')}] {label} 结束 (exit_codes={rcs}) ====================\n", flush=True)
+    print(
+        f"==================== [{time.strftime('%H:%M:%S')}] {label} 结束 (exit_codes={rcs}) ====================\n",
+        flush=True,
+    )
     return 0 if all(rc == 0 for rc in rcs) else 1
 
 
+def _run_step(label: str, cmd: List[str], env: dict[str, str]) -> int:
+    print(f"\n==================== [{time.strftime('%H:%M:%S')}] {label} ====================", flush=True)
+    proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env, check=False)
+    print(f"==================== [{time.strftime('%H:%M:%S')}] {label} 结束 (rc={proc.returncode}) ====================\n", flush=True)
+    return proc.returncode
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="声纹 -> ASR -> 标签复检 -> 增量多人声纹 -> 全量声纹编排脚本")
+    parser.add_argument("--skip-initial-vp", action="store_true", help="跳过阶段 1 初始声纹，直接从阶段 2 ASR 开始")
+    parser.add_argument("--vp-procs", type=int, default=3, help="声纹并行进程数（默认 3）")
+    parser.add_argument("--asr-procs", type=int, default=2, help="ASR 并行进程数（默认 2）")
+    args = parser.parse_args()
+
     env = os.environ.copy()
     hf_dir = PROJECT_ROOT / "data" / "cache" / "huggingface"
     tmp_dir = PROJECT_ROOT / "data" / "tmp_asr"
@@ -83,70 +110,101 @@ def main() -> int:
     env["TEMP"] = str(tmp_dir)
     env["PYTHONIOENCODING"] = "utf-8"
     env["CUDA_CACHE_MAXSIZE"] = "2147483648"
+    py = sys.executable
 
-    # 阶段 1：2 进程并行声纹发言人标注（断点续跑）
+    # 阶段 1（可选）：初始 multi_and_watch 声纹标注
+    if not args.skip_initial_vp:
+        try:
+            _run_sharded(
+                "VP1",
+                [
+                    "run.py", "run-voiceprint",
+                    "--scope", "multi_and_watch",
+                    "--device", "auto",
+                    "--batch-size", "64",
+                    "--limit", "0",
+                    "--threads", "4",
+                    "--prefetch", "2",
+                ],
+                n_procs=args.vp_procs,
+                env=env,
+            )
+        finally:
+            _cleanup_vp_tmp()
+        time.sleep(3)
+
+    # 阶段 2：2 进程并行 GPU ASR 补录全部无字幕新分 P
     try:
-        rc_vp = _run_sharded(
-            "VP",
+        rc_asr = _run_sharded(
+            "ASR",
             [
-                "run.py",
-                "run-voiceprint",
-                "--scope",
-                "multi_and_watch",
-                "--device",
-                "auto",
-                "--batch-size",
-                "64",
-                "--limit",
-                "0",
-                "--threads",
-                "4",
-                "--prefetch",
-                "2",
+                "run.py", "backfill-asr",
+                "--limit", "0",
+                "--batch-size", "12",
+                "--beam-size", "1",
+                "--chunk-length", "10",
+                "--workers", "1",
+                "--prefetch", "1",
             ],
-            n_procs=2,
+            n_procs=args.asr_procs,
+            env=env,
+        )
+    finally:
+        _cleanup_asr_tmp()
+    time.sleep(3)
+
+    # 阶段 3：专有名词纠错 + 全库场景标签复检（含新 ASR 场次与二创计画合集核对）
+    _run_step("专有名词纠错标准化", [py, "-u", "run.py", "normalize-corpus"], env)
+    _run_step("场景初筛补全 unknown", [py, "-u", "run.py", "tag-scenes", "--only-unknown"], env)
+    _run_step("二创计画合集标签复核", [py, "-u", "scripts/sync_archives.py", "--only-tags"], env)
+
+    # 阶段 4：先对 ASR 后新产生的多人场次 / 电影电台回进行 3 进程声纹识别（绝不重复跑已 ok 场次）
+    try:
+        rc_vp_new_multi = _run_sharded(
+            "VP-NEW-MULTI",
+            [
+                "run.py", "run-voiceprint",
+                "--scope", "multi_and_watch",
+                "--device", "auto",
+                "--batch-size", "64",
+                "--limit", "0",
+                "--threads", "4",
+                "--prefetch", "2",
+            ],
+            n_procs=args.vp_procs,
+            env=env,
+        )
+    finally:
+        _cleanup_vp_tmp()
+    time.sleep(3)
+
+    # 阶段 5：再对全库剩余全部未标注场次（单播等）进行 3 进程全量不重复声纹识别
+    try:
+        rc_vp_all = _run_sharded(
+            "VP-ALL-REM",
+            [
+                "run.py", "run-voiceprint",
+                "--scope", "all",
+                "--device", "auto",
+                "--batch-size", "64",
+                "--limit", "0",
+                "--threads", "4",
+                "--prefetch", "2",
+            ],
+            n_procs=args.vp_procs,
             env=env,
         )
     finally:
         _cleanup_vp_tmp()
 
-    if rc_vp != 0:
-        print(f"[WARN] 声纹阶段存在非零退出码 (rc={rc_vp})，仍继续启动 2 进程 GPU ASR 补录...", flush=True)
-
-    # 稍等 3 秒确保 GPU 显存完全释放
-    time.sleep(3)
-
-    # 阶段 2：2 进程并行 GPU ASR 补录无字幕新分 P
-    try:
-        rc_asr = _run_sharded(
-            "ASR",
-            [
-                "run.py",
-                "backfill-asr",
-                "--limit",
-                "0",
-                "--batch-size",
-                "12",
-                "--beam-size",
-                "1",
-                "--chunk-length",
-                "10",
-                "--workers",
-                "1",
-                "--prefetch",
-                "1",
-            ],
-            n_procs=2,
-            env=env,
-        )
-    finally:
-        _cleanup_asr_tmp()
-
-    # 阶段 3：优化 FTS5 索引与回收 WAL
-    print(f"[{time.strftime('%H:%M:%S')}] 正在执行数据库 FTS5 索引优化与 WAL 回收...", flush=True)
-    subprocess.run([sys.executable, "-u", "run.py", "optimize-db"], cwd=str(PROJECT_ROOT), env=env, check=False)
-    print(f"[{time.strftime('%H:%M:%S')}] 全流程完成 (rc_vp={rc_vp}, rc_asr={rc_asr})", flush=True)
-    return 0 if (rc_vp == 0 and rc_asr == 0) else 1
+    # 阶段 6：优化 FTS5 索引与回收 WAL
+    _run_step("压缩优化 FTS5 索引与 WAL", [py, "-u", "run.py", "optimize-db"], env)
+    print(
+        f"[{time.strftime('%H:%M:%S')}] 全流程完成 "
+        f"(rc_asr={rc_asr}, rc_vp_new_multi={rc_vp_new_multi}, rc_vp_all={rc_vp_all})",
+        flush=True,
+    )
+    return 0 if (rc_asr == 0 and rc_vp_new_multi == 0 and rc_vp_all == 0) else 1
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ class SubtitleRow:
     source: str = "bilibili_ai"
 
 
-VALID_SPEAKER_ATOMS = ("嘉然", "贝拉", "乃琳", "向晚", "心宜", "思诺", "其他")
+VALID_SPEAKER_ATOMS = ("嘉然", "贝拉", "乃琳", "向晚", "心宜", "思诺", "珈乐", "其他")
 
 
 def normalize_speaker_label(raw: str) -> str:

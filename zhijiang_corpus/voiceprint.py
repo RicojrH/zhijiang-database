@@ -874,7 +874,8 @@ def list_voiceprint_targets(
 ) -> List[Dict[str, Any]]:
     """列出待执行声纹发言人标注的分 P 列表（支持断点续跑与多进程分片）."""
     db.init_db()
-    clauses = ["subtitle_status = 'ok'", "line_count > 0", "duration_sec >= 15"]
+    # 珈乐不在 6 人声纹库内，其个人单播直接归属「珈乐」而不送入 6 人声纹模型误判
+    clauses = ["subtitle_status = 'ok'", "line_count > 0", "duration_sec >= 15", "up_name != '珈乐'"]
     if not force:
         clauses.append("voiceprint_status != 'ok'")
     if scope == "multi_only":
@@ -916,6 +917,7 @@ def get_voiceprint_progress(db: CorpusDB) -> Dict[str, Any]:
              WHERE subtitle_status = 'ok'
                AND line_count > 0
                AND duration_sec >= 15
+               AND up_name != '珈乐'
                AND (scene_type IN ('duo', 'group', 'special') OR (scene_type = 'solo' AND {watch_sql}))
             """
         ).fetchone()
@@ -969,6 +971,37 @@ def run_voiceprint_batch(
 ) -> Dict[str, Any]:
     """后台流水线批量声纹标注（多线程并发预取音频 + GPU 批量推理 + WAL 事务写库 + 立即删临时音频）."""
     emit = progress_cb or (lambda msg: print(msg, flush=True))
+    # 珈乐单播不进入 6 人声纹模型：自动将所有已有字幕且未标注的珈乐个人场次直接归属「珈乐」
+    if shard_index == 0:
+        with db.session() as conn:
+            pending_carol = conn.execute(
+                """
+                SELECT COUNT(*) FROM videos
+                 WHERE up_name = '珈乐' AND subtitle_status = 'ok' AND line_count > 0
+                   AND voiceprint_status != 'ok'
+                """
+            ).fetchone()[0]
+            if pending_carol:
+                conn.execute(
+                    """
+                    UPDATE subtitles
+                       SET speaker_name = '珈乐', speaker_conf = 1.0
+                     WHERE up_name = '珈乐'
+                       AND bvid IN (
+                           SELECT bvid FROM videos
+                            WHERE up_name = '珈乐' AND subtitle_status = 'ok' AND line_count > 0
+                       )
+                    """
+                )
+                conn.execute(
+                    """
+                    UPDATE videos
+                       SET voiceprint_status = 'ok',
+                           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                     WHERE up_name = '珈乐' AND subtitle_status = 'ok' AND line_count > 0
+                    """
+                )
+                emit(f"[自动归属] 已将 {pending_carol} 个珈乐单播分 P 发言人直接标为「珈乐」。")
     targets = list_voiceprint_targets(
         db,
         scope=scope,
