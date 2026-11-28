@@ -409,6 +409,24 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"未找到视频记录: {bvid}")
         return {"status": "ok", **res}
 
+    @router.delete("/videos/{bvid}", summary="彻底删除已入库的指定场次分 P（或整个 BV 号全部分 P）")
+    def delete_video(
+        bvid: str,
+        page: Optional[int] = Query(
+            default=None,
+            ge=1,
+            description="指定分 P；留空则删除该 BV 号的全部分 P",
+        ),
+    ) -> Dict[str, Any]:
+        try:
+            res = db.delete_video(bvid, page=page)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not res.get("found"):
+            scope = f" P{page}" if page is not None else ""
+            raise HTTPException(status_code=404, detail=f"未找到视频记录: {bvid}{scope}")
+        return {"status": "ok", **res}
+
     @router.post("/db/optimize", summary="大批量抓取后优化 FTS5 索引与回收 WAL")
     def optimize_db() -> Dict[str, Any]:
         return db.optimize_db()
@@ -537,9 +555,10 @@ def build_admin_router(db: CorpusDB) -> APIRouter:
                         log_cb=_cloud_log,
                     )
                     ap = res.get("applied") or {}
+                    del_part = f"，删除 {ap.get('parts_deleted', 0)} 个分P" if ap.get("parts_deleted") else ""
                     summary = (
                         f"数据库增量同步完成：写入 {ap.get('parts_applied', 0)} 个分P / "
-                        f"{ap.get('subtitles_inserted', 0):,} 条字幕"
+                        f"{ap.get('subtitles_inserted', 0):,} 条字幕{del_part}"
                     )
                 with cloud_lock:
                     cloud_state["last_summary"] = summary

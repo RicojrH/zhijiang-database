@@ -196,6 +196,7 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
         up_name: Optional[str] = None,
         scene_type: Optional[str] = None,
         status: Optional[str] = Query(default="ok", description="默认仅展示已入库字幕的分 P"),
+        q: Optional[str] = Query(default=None, description="按 BV 号或标题关键词筛选"),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> Dict[str, Any]:
@@ -203,6 +204,7 @@ def build_public_router(db: CorpusDB, cfg: AppConfig) -> APIRouter:
             up_name=up_name,
             scene_type=scene_type,
             status=status or None,
+            q=q,
             include_hidden=False,
             limit=limit,
             offset=offset,

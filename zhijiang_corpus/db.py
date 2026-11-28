@@ -448,6 +448,80 @@ class CorpusDB:
                 )
             return cur.rowcount
 
+    def delete_video(
+        self,
+        bvid: str,
+        page: Optional[int] = None,
+        *,
+        clear_logs: bool = True,
+    ) -> Dict[str, Any]:
+        """彻底删除指定视频分 P（或整个 BV 号全部分 P）及其关联字幕、FTS5 索引与抓取日志.
+
+        典型场景：视频刚投稿尚未生成 B 站 AI 字幕时被提前抓入库（标记为 no_subtitle/pending），
+        删除后可等待 AI 字幕生成完毕再重新增量抓取入库。
+        """
+        clean_bvid = (bvid or "").strip()
+        if not clean_bvid:
+            raise ValueError("bvid 不能为空")
+        with self.session() as conn:
+            if page is None:
+                # 先删 subtitles（trg_subtitles_ad 自动同步清理 FTS5 索引），再删 videos
+                s_cur = conn.execute(
+                    "DELETE FROM subtitles WHERE bvid = ?",
+                    (clean_bvid,),
+                )
+                v_cur = conn.execute(
+                    "DELETE FROM videos WHERE bvid = ?",
+                    (clean_bvid,),
+                )
+                deleted_logs = 0
+                if clear_logs:
+                    l_cur = conn.execute(
+                        "DELETE FROM ingest_logs WHERE bvid = ?",
+                        (clean_bvid,),
+                    )
+                    deleted_logs = max(0, int(l_cur.rowcount or 0))
+            else:
+                p = int(page)
+                s_cur = conn.execute(
+                    "DELETE FROM subtitles WHERE bvid = ? AND page = ?",
+                    (clean_bvid, p),
+                )
+                v_cur = conn.execute(
+                    "DELETE FROM videos WHERE bvid = ? AND page = ?",
+                    (clean_bvid, p),
+                )
+                deleted_logs = 0
+                if clear_logs:
+                    l_cur = conn.execute(
+                        "DELETE FROM ingest_logs WHERE bvid = ? AND page = ?",
+                        (clean_bvid, p),
+                    )
+                    deleted_logs = max(0, int(l_cur.rowcount or 0))
+                    # 若该 BV 号已无剩余分 P，顺手清理 page=0 的视频级日志
+                    rem = conn.execute(
+                        "SELECT COUNT(*) FROM videos WHERE bvid = ?",
+                        (clean_bvid,),
+                    ).fetchone()[0]
+                    if int(rem or 0) == 0:
+                        l0 = conn.execute(
+                            "DELETE FROM ingest_logs WHERE bvid = ? AND page = 0",
+                            (clean_bvid,),
+                        )
+                        deleted_logs += max(0, int(l0.rowcount or 0))
+
+            deleted_videos = max(0, int(v_cur.rowcount or 0))
+            deleted_subtitles = max(0, int(s_cur.rowcount or 0))
+
+        return {
+            "found": deleted_videos > 0,
+            "bvid": clean_bvid,
+            "page": int(page) if page is not None else None,
+            "deleted_videos": deleted_videos,
+            "deleted_subtitles": deleted_subtitles,
+            "deleted_logs": deleted_logs,
+        }
+
     def update_subtitle_speaker(
         self,
         subtitle_id: int,

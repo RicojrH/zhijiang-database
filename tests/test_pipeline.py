@@ -797,3 +797,131 @@ def test_room_and_speaker_independent_search(tmp_path: Path) -> None:
     r_both_jr = client.get("/api/v1/search", params={"q": "火锅", "up_name": "嘉然", "speaker": "嘉然"}).json()
     assert r_both_jr["pagination"]["total"] == 3
     assert {it["content"] for it in r_both_jr["items"]} == {"火锅真好吃呀", "火锅一起吃吧", "单播吃火锅咯"}
+
+
+def test_delete_video_api_reingest_and_delta_sync(tmp_path: Path) -> None:
+    """验证已入库场次的按分P/整场删除、FTS5 索引同步、公网隔离、删除后重抓及增量同步云端删除."""
+    from zhijiang_corpus.db import SubtitleRow, VideoRecord
+    from zhijiang_corpus.sync_delta import apply_delta, build_manifest, export_delta
+
+    db_file = tmp_path / "delete_test.db"
+    db = CorpusDB(db_file)
+    db.init_db()
+
+    # 写入一个双 P 场次（P1 有字幕，P2 尚未生成 AI 字幕被误导入为 no_subtitle）+ 另一场正常录播
+    db.save_video_and_subtitles(
+        VideoRecord(
+            bvid="BV1DEL000001",
+            page=1,
+            up_name="嘉然",
+            title="误提前导入的回放",
+            part_title="P1 上半场",
+            pub_date="2026-11-28",
+            subtitle_status="ok",
+            scene_type="solo",
+        ),
+        [
+            SubtitleRow(
+                up_name="嘉然",
+                bvid="BV1DEL000001",
+                page=1,
+                pub_date="2026-11-28",
+                start_sec=1.0,
+                end_sec=3.0,
+                content="待删除测试台词独一无二",
+                scene_type="solo",
+            )
+        ],
+    )
+    db.save_video_and_subtitles(
+        VideoRecord(
+            bvid="BV1DEL000001",
+            page=2,
+            up_name="嘉然",
+            title="误提前导入的回放",
+            part_title="P2 下半场",
+            pub_date="2026-11-28",
+            subtitle_status="no_subtitle",
+            scene_type="solo",
+        ),
+        [],
+    )
+    db.save_video_and_subtitles(
+        VideoRecord(
+            bvid="BV1KEEP00001",
+            page=1,
+            up_name="乃琳",
+            title="保留的正常场次",
+            pub_date="2026-11-27",
+            subtitle_status="ok",
+            scene_type="solo",
+        ),
+        [
+            SubtitleRow(
+                up_name="乃琳",
+                bvid="BV1KEEP00001",
+                page=1,
+                pub_date="2026-11-27",
+                start_sec=5.0,
+                end_sec=8.0,
+                content="保留场次正常字幕",
+                scene_type="solo",
+            )
+        ],
+    )
+    db.log_ingest("run1", "BV1DEL000001", 2, "no_subtitle", "no track yet")
+
+    # 模拟云端已有相同初始数据
+    cloud_db = CorpusDB(tmp_path / "delete_cloud.db")
+    cloud_db.init_db()
+    init_delta = tmp_path / "init_delta.json.gz"
+    export_delta(db, build_manifest(cloud_db), init_delta)
+    apply_delta(cloud_db, init_delta)
+    assert cloud_db.get_video("BV1DEL000001", 1) is not None
+    assert cloud_db.get_video("BV1DEL000001", 2) is not None
+
+    # 1. 公网只读模式禁止删除接口
+    pub_client = TestClient(create_app(db_path=db_file, enable_admin=False))
+    assert pub_client.delete("/api/v1/admin/videos/BV1DEL000001?page=2").status_code == 404
+
+    # 2. 本地管理模式：支持按 BV/标题筛选 + 删除单分P + 删除整场 BV
+    loc_client = TestClient(create_app(db_path=db_file, enable_admin=True))
+    vlist = loc_client.get("/api/v1/videos", params={"status": "", "q": "BV1DEL000001"}).json()
+    assert vlist["total"] == 2
+
+    # 删除 P2（no_subtitle 分P），P1 保持完好
+    r_del_p2 = loc_client.delete("/api/v1/admin/videos/BV1DEL000001", params={"page": 2})
+    assert r_del_p2.status_code == 200
+    d2 = r_del_p2.json()
+    assert d2["deleted_videos"] == 1
+    assert d2["deleted_subtitles"] == 0
+    assert db.get_video("BV1DEL000001", 2) is None
+    assert db.get_video("BV1DEL000001", 1) is not None
+
+    # 删除整个 BV1DEL000001（剩余的 P1 及其字幕和 FTS5 索引一并移除）
+    r_del_all = loc_client.delete("/api/v1/admin/videos/BV1DEL000001")
+    assert r_del_all.status_code == 200
+    da = r_del_all.json()
+    assert da["deleted_videos"] == 1
+    assert da["deleted_subtitles"] == 1
+    assert db.get_video("BV1DEL000001", 1) is None
+    assert db.is_bvid_completed("BV1DEL000001", allow_no_subtitle=True) is False
+    # FTS5 全文检索已同步清空
+    sr = loc_client.get("/api/v1/search", params={"q": "待删除测试台词独一无二"}).json()
+    assert sr["pagination"]["total"] == 0
+    # 再次删除同一 BV 返回 404
+    assert loc_client.delete("/api/v1/admin/videos/BV1DEL000001").status_code == 404
+    # 保留的场次不受影响
+    assert db.get_video("BV1KEEP00001", 1) is not None
+
+    # 3. 增量同步将本地删除同步到云端（零停服移除云端误导入场次与 FTS5 索引）
+    del_delta = tmp_path / "del_delta.json.gz"
+    exp = export_delta(db, build_manifest(cloud_db), del_delta)
+    assert exp["parts_deleted"] == 2
+    ap = apply_delta(cloud_db, del_delta)
+    assert ap["parts_deleted"] == 2
+    assert ap["subtitles_deleted"] == 1
+    assert cloud_db.get_video("BV1DEL000001", 1) is None
+    assert cloud_db.get_video("BV1DEL000001", 2) is None
+    assert cloud_db.get_video("BV1KEEP00001", 1) is not None
+    assert SearchService(cloud_db).search(SearchQuery(q="待删除测试台词独一无二"))["pagination"]["total"] == 0

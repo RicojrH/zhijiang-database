@@ -67,7 +67,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=_parse_cors_origins(),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PATCH", "OPTIONS"] if enable_admin else ["GET", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] if enable_admin else ["GET", "OPTIONS"],
         allow_headers=["*"],
     )
 

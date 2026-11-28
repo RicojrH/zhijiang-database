@@ -67,6 +67,8 @@
     button.btn.orange:hover { background: #c2410c; border-color: #c2410c; }
     button.btn.green { background: #059669; border-color: #059669; color: #fff; }
     button.btn.green:hover { background: #047857; border-color: #047857; }
+    button.btn.danger { background: #dc2626; border-color: #dc2626; color: #fff; }
+    button.btn.danger:hover { background: #b91c1c; border-color: #b91c1c; }
     button.btn:disabled { opacity: 0.45; cursor: not-allowed; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
     .chip {
@@ -104,6 +106,12 @@
       padding: 2px 4px; font-size: 12.5px; text-decoration: none;
     }
     .link-btn:hover { text-decoration: underline; }
+    .link-btn.danger { color: #dc2626; }
+    .notice-bar {
+      margin-bottom: 12px; padding: 10px 14px; border-radius: 8px;
+      background: var(--ok-soft); border: 1px solid #a7f3d0; color: #065f46;
+      font-size: 13px; display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    }
     .ctx-box {
       margin-top: 10px; padding: 10px 12px; background: #f8fafc;
       border-left: 3px solid #cbd5e1; border-radius: 6px; font-size: 13px; line-height: 1.6;
@@ -270,9 +278,14 @@
           <select id="vStatusFilter" onchange="loadVideos(1)">
             <option value="">全部</option>
             <option value="ok">ok（已入库字幕）</option>
-            <option value="no_subtitle">no_subtitle</option>
-            <option value="pending">pending</option>
+            <option value="no_subtitle">no_subtitle（无字幕）</option>
+            <option value="pending">pending（待处理）</option>
+            <option value="asr_empty">asr_empty（空音频）</option>
+            <option value="failed">failed（失败）</option>
           </select>
+        </label>
+        <label>筛选：
+          <input id="vQueryFilter" type="text" placeholder="BV号或标题关键词" style="width:165px;" onkeydown="if(event.key==='Enter') loadVideos(1)" />
         </label>
         <label>每页：
           <select id="vPageSize" onchange="loadVideos(1)">
@@ -281,10 +294,14 @@
             <option value="200">200 条</option>
           </select>
         </label>
-        <button class="btn sec" onclick="loadVideos(videoPage)">刷新列表</button>
+        <button class="btn sec" onclick="loadVideos(1)">查询 / 刷新</button>
         <button class="btn sec" onclick="triggerSceneTag()">运行轻量场景初筛</button>
         <button class="btn sec" onclick="triggerOptimizeDb()">压缩优化索引</button>
       </div>
+    </div>
+    <div id="videosOpNotice" class="notice-bar hidden">
+      <span id="videosOpNoticeText"></span>
+      <button class="link-btn" style="color:#065f46;" onclick="document.getElementById('videosOpNotice').classList.add('hidden')">关闭</button>
     </div>
     <div class="toolbar">
       <div id="videosSummary">共 — 个分P</div>
@@ -613,6 +630,36 @@
   </div>
 </div>
 
+<div id="deleteVideoModal" class="modal-mask hidden" onclick="if(event.target===this) closeDeleteVideoModal()">
+  <div class="modal-card">
+    <h3 style="color:#b91c1c;">删除已入库场次</h3>
+    <div id="delModalInfo" style="font-size:13px;color:var(--text);line-height:1.6;padding:10px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;"></div>
+    <input type="hidden" id="delModalBvid" />
+    <input type="hidden" id="delModalPage" />
+    <div class="modal-field">
+      <label>删除范围</label>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px;">
+        <label style="display:flex;align-items:center;gap:8px;color:var(--text);cursor:pointer;">
+          <input type="radio" name="delModalScope" id="delScopePart" value="part" checked style="width:auto;" />
+          <span id="delScopePartLabel">仅删除当前分 P</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;color:var(--text);cursor:pointer;">
+          <input type="radio" name="delModalScope" id="delScopeAll" value="all" style="width:auto;" />
+          <span id="delScopeAllLabel">删除该 BV 号的全部分 P</span>
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:10px;font-size:12.5px;color:var(--muted);line-height:1.55;">
+      删除后将从本地数据库彻底移除所选场次记录、关联字幕与全文索引（不影响 B 站原视频）。若因提前导入了尚未生成 AI 字幕的录播，删除后待字幕生成完毕重新抓取即可；如已同步过云端，后续在「云端同步」页点击增量同步即可一并移除云端记录。
+    </div>
+    <div id="delModalMsg" style="margin-top:10px;font-size:12.5px;min-height:18px;"></div>
+    <div style="margin-top:14px;display:flex;justify-content:flex-end;gap:8px;">
+      <button class="btn sec" onclick="closeDeleteVideoModal()">取消</button>
+      <button class="btn danger" id="delModalSubmitBtn" onclick="confirmDeleteVideo()">确认删除</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let selectedUps = new Set();
 let selectedSpeakers = new Set();
@@ -621,6 +668,7 @@ let totalPages = 0;
 const pageLimit = 20;
 let videoPage = 1;
 let videoTotalPages = 0;
+let videosPageItems = [];
 let qrTimer = null;
 let ingestTimer = null;
 let archiveTimer = null;
@@ -925,9 +973,11 @@ async function loadVideos(page) {
   const up = document.getElementById('vUpFilter').value;
   const sc = document.getElementById('vSceneFilter').value;
   const st = document.getElementById('vStatusFilter').value;
+  const qv = (document.getElementById('vQueryFilter')?.value || '').trim();
   if (up) params.set('up_name', up);
   if (sc) params.set('scene_type', sc);
   if (st) params.set('status', st); else params.set('status', '');
+  if (qv) params.set('q', qv);
   params.set('limit', limit);
   params.set('offset', offset);
   const r = await fetch('/api/v1/videos?' + params.toString());
@@ -937,15 +987,16 @@ async function loadVideos(page) {
   if (videoTotalPages > 0 && videoPage > videoTotalPages) {
     return loadVideos(videoTotalPages);
   }
+  videosPageItems = data.items || [];
   const startNum = total === 0 ? 0 : offset + 1;
-  const endNum = offset + data.items.length;
+  const endNum = offset + videosPageItems.length;
   document.getElementById('videosSummary').textContent =
     `共 ${total.toLocaleString()} 个分P（当前显示 ${startNum} - ${endNum}）`;
   renderVideosPagers();
 
   const tbody = document.getElementById('videosTbody');
-  if (!data.items.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无已入库场次</td></tr>'; return; }
-  tbody.innerHTML = data.items.map(v => {
+  if (!videosPageItems.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无已入库场次</td></tr>'; return; }
+  tbody.innerHTML = videosPageItems.map((v, idx) => {
     const vUrl = v.page > 1 ? `https://www.bilibili.com/video/${esc(v.bvid)}/?p=${v.page}` : `https://www.bilibili.com/video/${esc(v.bvid)}/`;
     const lockTag = v.scene_locked ? '<span style="margin-left:4px;font-size:11px;color:var(--ok);" title="已人工锁定">🔒</span>' : '<span style="margin-left:4px;font-size:11px;color:var(--muted);"></span>';
     return `
@@ -963,14 +1014,21 @@ async function loadVideos(page) {
         </td>
         <td style="white-space:nowrap;">
           <button class="link-btn" onclick="searchByBvid('${esc(v.bvid)}')">搜本场</button>
-          <button class="link-btn" onclick="openSpeakerModal('${esc(v.bvid)}', ${v.page}, '${esc(v.up_name)}', '${esc(v.title)}')">改发言人</button>
+          <button class="link-btn" onclick="openSpeakerModal(${idx})">改发言人</button>
+          <button class="link-btn danger" onclick="openDeleteVideoModal(${idx})">删除</button>
         </td>
       </tr>
     `;
   }).join('');
 }
 
-function openSpeakerModal(bvid, page, upName, title) {
+function openSpeakerModal(idx) {
+  const v = videosPageItems[idx];
+  if (!v) return;
+  const bvid = v.bvid;
+  const page = v.page;
+  const upName = v.up_name || '';
+  const title = v.title || '';
   document.getElementById('spModalBvid').value = bvid;
   document.getElementById('spModalPage').value = page;
   document.getElementById('spModalInfo').innerHTML = `目标场次：<b>${esc(bvid)} P${page}</b>（${esc(upName)}直播间）<br>${esc(title)}`;
@@ -985,6 +1043,60 @@ function openSpeakerModal(bvid, page, upName, title) {
 
 function closeSpeakerModal() {
   document.getElementById('speakerBatchModal').classList.add('hidden');
+}
+
+function openDeleteVideoModal(idx) {
+  const v = videosPageItems[idx];
+  if (!v) return;
+  document.getElementById('delModalBvid').value = v.bvid;
+  document.getElementById('delModalPage').value = v.page;
+  const partLine = v.part_title && v.part_title !== v.title ? `<br>分P标题：${esc(v.part_title)}` : '';
+  document.getElementById('delModalInfo').innerHTML =
+    `<b>${esc(v.up_name)}</b> · ${esc(v.pub_date)} · <b>${esc(v.bvid)} P${v.page}</b><br>` +
+    `标题：${esc(v.title)}${partLine}<br>` +
+    `状态：<b>${esc(v.subtitle_status)}</b> ｜ 字幕条数：<b>${Number(v.line_count || 0).toLocaleString()}</b>`;
+  document.getElementById('delScopePartLabel').textContent = `仅删除当前分 P（${v.bvid} P${v.page}）`;
+  document.getElementById('delScopeAllLabel').textContent = `删除该 BV 号的全部分 P（${v.bvid} 全部记录）`;
+  document.getElementById('delScopePart').checked = true;
+  document.getElementById('delModalMsg').textContent = '';
+  document.getElementById('deleteVideoModal').classList.remove('hidden');
+}
+
+function closeDeleteVideoModal() {
+  document.getElementById('deleteVideoModal').classList.add('hidden');
+}
+
+async function confirmDeleteVideo() {
+  const bvid = document.getElementById('delModalBvid').value;
+  const page = parseInt(document.getElementById('delModalPage').value || '1', 10);
+  const scope = document.getElementById('delScopeAll').checked ? 'all' : 'part';
+  const msgEl = document.getElementById('delModalMsg');
+  const btn = document.getElementById('delModalSubmitBtn');
+  btn.disabled = true;
+  btn.textContent = '删除中...';
+  msgEl.style.color = 'var(--muted)';
+  msgEl.textContent = '正在删除场次与关联字幕索引...';
+  try {
+    const qs = scope === 'part' ? `?page=${encodeURIComponent(page)}` : '';
+    const r = await fetch(`/api/v1/admin/videos/${encodeURIComponent(bvid)}${qs}`, {
+      method: 'DELETE',
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      msgEl.style.color = '#dc2626';
+      msgEl.textContent = '❌ ' + (data.detail || '删除失败');
+      return;
+    }
+    closeDeleteVideoModal();
+    const scopeTxt = scope === 'part' ? `${bvid} P${page}` : `${bvid}（全部分P）`;
+    document.getElementById('videosOpNoticeText').textContent =
+      `✅ 已删除 ${scopeTxt}：共移除 ${data.deleted_videos} 个分P、${Number(data.deleted_subtitles || 0).toLocaleString()} 条字幕。现在可等 B 站生成 AI 字幕后重新抓取入库。`;
+    document.getElementById('videosOpNotice').classList.remove('hidden');
+    await Promise.all([loadVideos(videoPage), loadStats()]);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '确认删除';
+  }
 }
 
 async function submitBatchSpeakers() {

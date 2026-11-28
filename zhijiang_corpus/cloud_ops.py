@@ -619,9 +619,11 @@ def sync_database_to_cloud(
         remote_manifest = json.loads(out.strip()) if out.strip() else {}
 
         exp = export_delta(db, remote_manifest, delta_file)
+        parts_deleted_exp = int(exp.get("parts_deleted", 0))
+        has_delta = int(exp["parts_changed"]) > 0 or parts_deleted_exp > 0
         log_cb(
             f"字幕差异比对完成：本地 {exp['local_parts']} / 云端 {exp['remote_parts']} | "
-            f"需同步 {exp['parts_changed']} 个分P（新增 {exp['parts_new']}，更新 {exp['parts_updated']}）| "
+            f"需同步 {exp['parts_changed']} 个分P（新增 {exp['parts_new']}，更新 {exp['parts_updated']}，删除 {parts_deleted_exp}）| "
             f"字幕 {exp['subtitles_exported']:,} 条 | 补丁 {exp['delta_size_kb']} KB"
         )
 
@@ -634,8 +636,8 @@ def sync_database_to_cloud(
                 log_cb("同步本地 config/announcements.json 到云端...")
                 sftp.put(str(ANNOUNCEMENTS_PATH), posixpath.join(app_dir, "config", "announcements.json"))
 
-            apply_info: Dict[str, Any] = {"parts_applied": 0, "subtitles_inserted": 0}
-            if int(exp["parts_changed"]) > 0:
+            apply_info: Dict[str, Any] = {"parts_applied": 0, "parts_deleted": 0, "subtitles_inserted": 0}
+            if has_delta:
                 remote_delta = "/tmp/zhijiang_delta.json.gz"
                 log_cb(f"正在通过 SFTP 上传增量字幕补丁 ({exp['delta_size_kb']} KB)...")
                 sftp.put(str(delta_file), remote_delta)
@@ -645,7 +647,7 @@ def sync_database_to_cloud(
         finally:
             sftp.close()
 
-        if int(exp["parts_changed"]) > 0:
+        if has_delta:
             log_cb("正在云端热合并字幕入库并增量更新 FTS5 索引...")
             code, out, err = _exec_remote(
                 client,
@@ -655,9 +657,10 @@ def sync_database_to_cloud(
             if code != 0:
                 raise RuntimeError(f"云端热合并失败: {err or out}")
             apply_info = json.loads(out.strip())
+            del_note = f"，删除 {apply_info.get('parts_deleted', 0)} 个分P" if apply_info.get("parts_deleted") else ""
             log_cb(
                 f"✅ 字幕增量写入完成：{apply_info.get('parts_applied', 0)} 个分P / "
-                f"{apply_info.get('subtitles_inserted', 0):,} 条字幕。"
+                f"{apply_info.get('subtitles_inserted', 0):,} 条字幕{del_note}。"
             )
         else:
             log_cb("✅ 云端字幕库已与本地 100% 一致，无需上传字幕补丁。")

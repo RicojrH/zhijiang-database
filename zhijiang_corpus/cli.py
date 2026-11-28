@@ -355,6 +355,22 @@ def cmd_set_visibility(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delete_video(args: argparse.Namespace) -> int:
+    cfg = load_config(db_path=args.db)
+    db = CorpusDB(cfg.db_path)
+    res = db.delete_video(args.bvid, args.page)
+    if not res["found"]:
+        scope = f" P{args.page}" if args.page is not None else ""
+        print(f"[WARN] 未找到视频记录: {args.bvid}{scope}")
+        return 1
+    print(
+        f"[OK] 已删除 {res['bvid']}"
+        + (f" P{res['page']}" if res["page"] is not None else "（全部分 P）")
+        + f"：移除 {res['deleted_videos']} 个分 P、{res['deleted_subtitles']} 条字幕、{res['deleted_logs']} 条抓取日志。"
+    )
+    return 0
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     cfg = load_config(db_path=args.db)
     db = CorpusDB(cfg.db_path)
@@ -616,6 +632,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_vis.add_argument("visible", type=int, choices=[0, 1], help="1=可见，0=隐藏")
     p_vis.add_argument("--page", type=int, default=None, help="指定分 P")
     p_vis.set_defaults(func=cmd_set_visibility)
+
+    p_del = sub.add_parser("delete-video", help="彻底删除已入库的指定场次分 P（或整个 BV 号全部分 P）及其字幕，便于重新抓取")
+    p_del.add_argument("bvid", help="BV 号")
+    p_del.add_argument("--page", type=int, default=None, help="指定分 P（不填则删除该 BV 号的全部分 P）")
+    p_del.set_defaults(func=cmd_delete_video)
 
     p_search = sub.add_parser("search", help="关键词搜索字幕语料")
     p_search.add_argument("q", nargs="?", default="", help="搜索关键词（空格分隔多词 AND）")

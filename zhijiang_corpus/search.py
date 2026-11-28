@@ -300,6 +300,7 @@ class SearchService:
         up_name: Optional[str] = None,
         scene_type: Optional[str] = None,
         status: Optional[str] = None,
+        q: Optional[str] = None,
         include_hidden: bool = False,
         limit: int = 50,
         offset: int = 0,
@@ -319,6 +320,10 @@ class SearchService:
         if status:
             clauses.append("subtitle_status = ?")
             params.append(status.strip())
+        if q and q.strip():
+            kw = f"%{q.strip()}%"
+            clauses.append("(bvid LIKE ? OR title LIKE ? OR part_title LIKE ?)")
+            params.extend([kw, kw, kw])
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
         with self.db.session() as conn:

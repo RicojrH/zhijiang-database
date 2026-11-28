@@ -83,8 +83,10 @@ def export_delta(
     db: CorpusDB,
     remote_manifest: Dict[str, Dict[str, Any]],
     out_path: str | Path,
+    *,
+    include_deletes: bool = True,
 ) -> Dict[str, Any]:
-    """对比本地库与云端清单，仅导出新增或有改动的分 P 及其字幕到 gzip JSON 补丁包."""
+    """对比本地库与云端清单，导出新增/变动分 P 及本地已删除分 P 到 gzip JSON 补丁包."""
     local_manifest = build_manifest(db)
     changed_keys: List[Tuple[str, int]] = []
     new_parts = 0
@@ -99,6 +101,17 @@ def export_delta(
                 new_parts += 1
             else:
                 updated_parts += 1
+
+    # 检测本地已删除但云端仍存在的分 P（带防误清库保护：本地为空或单次删除比例过高时不自动删除）
+    deleted_keys: List[Tuple[str, int]] = []
+    if include_deletes and remote_manifest and local_manifest:
+        raw_deleted: List[Tuple[str, int]] = []
+        for key in remote_manifest:
+            if key not in local_manifest and "#" in key:
+                bvid, page_str = key.rsplit("#", 1)
+                raw_deleted.append((bvid, int(page_str)))
+        if len(remote_manifest) <= 20 or len(raw_deleted) <= max(20, int(len(remote_manifest) * 0.2)):
+            deleted_keys = sorted(raw_deleted)
 
     changed_keys.sort()
     parts_payload: List[Dict[str, Any]] = []
@@ -147,12 +160,15 @@ def export_delta(
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    deleted_payload = [[bvid, page] for bvid, page in deleted_keys]
     payload = {
         "version": 1,
         "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "parts_count": len(parts_payload),
+        "deleted_count": len(deleted_payload),
         "subtitles_count": total_subtitles,
         "parts": parts_payload,
+        "deleted_parts": deleted_payload,
     }
     raw_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     with gzip.open(out, "wb", compresslevel=6) as gz:
@@ -167,6 +183,7 @@ def export_delta(
         "parts_changed": len(parts_payload),
         "parts_new": new_parts,
         "parts_updated": updated_parts,
+        "parts_deleted": len(deleted_payload),
         "subtitles_exported": total_subtitles,
         "delta_size_kb": size_kb,
     }
@@ -188,10 +205,13 @@ def apply_delta(
         payload = json.loads(gz.read().decode("utf-8"))
 
     parts = payload.get("parts") or []
+    deleted_parts = payload.get("deleted_parts") or []
     parts_applied = 0
     subtitles_inserted = 0
+    parts_deleted = 0
+    subtitles_deleted = 0
 
-    if parts:
+    if parts or deleted_parts:
         placeholders = ", ".join("?" for _ in VIDEO_COLS)
         cols_sql = ", ".join(VIDEO_COLS)
         update_assigns = ", ".join(
@@ -205,6 +225,28 @@ def apply_delta(
         """
 
         with db.session() as conn:
+            for d_item in deleted_parts:
+                if not isinstance(d_item, (list, tuple)) or len(d_item) < 2:
+                    continue
+                d_bvid = str(d_item[0]).strip()
+                d_page = int(d_item[1])
+                if not d_bvid:
+                    continue
+                sc = conn.execute(
+                    "DELETE FROM subtitles WHERE bvid = ? AND page = ?",
+                    (d_bvid, d_page),
+                )
+                vc = conn.execute(
+                    "DELETE FROM videos WHERE bvid = ? AND page = ?",
+                    (d_bvid, d_page),
+                )
+                conn.execute(
+                    "DELETE FROM ingest_logs WHERE bvid = ? AND page = ?",
+                    (d_bvid, d_page),
+                )
+                parts_deleted += max(0, int(vc.rowcount or 0))
+                subtitles_deleted += max(0, int(sc.rowcount or 0))
+
             for item in parts:
                 v = item["video"]
                 bvid = str(v["bvid"])
@@ -280,7 +322,9 @@ def apply_delta(
     return {
         "status": "ok",
         "parts_applied": parts_applied,
+        "parts_deleted": parts_deleted,
         "subtitles_inserted": subtitles_inserted,
+        "subtitles_deleted": subtitles_deleted,
         "live_stats": {
             "subtitles_total": st["subtitles_total"],
             "video_parts_ok": st["video_parts_ok"],

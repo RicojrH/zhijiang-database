@@ -143,12 +143,13 @@ $ExportOut = & $Py run.py export-delta --remote-manifest $ManifestFile --out $De
 if ($LASTEXITCODE -ne 0) { throw "本地生成增量补丁失败。" }
 $ExportInfo = ($ExportOut -join "`n") | ConvertFrom-Json
 
-Write-Host ("    本地分P: {0} | 云端分P: {1} | 需同步分P: {2}（新增 {3}，更新 {4}）| 字幕: {5:N0} 条 | 补丁体积: {6} KB" -f `
+$PartsDeletedExp = if ($null -ne $ExportInfo.parts_deleted) { [int]$ExportInfo.parts_deleted } else { 0 }
+Write-Host ("    本地分P: {0} | 云端分P: {1} | 需同步分P: {2}（新增 {3}，更新 {4}，删除 {5}）| 字幕: {6:N0} 条 | 补丁体积: {7} KB" -f `
     $ExportInfo.local_parts, $ExportInfo.remote_parts, $ExportInfo.parts_changed, `
-    $ExportInfo.parts_new, $ExportInfo.parts_updated, $ExportInfo.subtitles_exported, $ExportInfo.delta_size_kb) -ForegroundColor White
+    $ExportInfo.parts_new, $ExportInfo.parts_updated, $PartsDeletedExp, $ExportInfo.subtitles_exported, $ExportInfo.delta_size_kb) -ForegroundColor White
 
-$ApplyInfo = [pscustomobject]@{ parts_applied = 0; subtitles_inserted = 0 }
-if ([int]$ExportInfo.parts_changed -gt 0) {
+$ApplyInfo = [pscustomobject]@{ parts_applied = 0; parts_deleted = 0; subtitles_inserted = 0 }
+if ([int]$ExportInfo.parts_changed -gt 0 -or $PartsDeletedExp -gt 0) {
     Write-Host "`n    正在上传增量字幕补丁 ($($ExportInfo.delta_size_kb) KB) 到 $CloudHost ..." -ForegroundColor Cyan
     & scp $DeltaFile "${CloudHost}:/tmp/zhijiang_delta.json.gz"
     if ($LASTEXITCODE -ne 0) { throw "SCP 上传补丁失败。" }
