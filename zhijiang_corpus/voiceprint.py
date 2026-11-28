@@ -48,8 +48,13 @@ _BUCKET_STEP_SAMPLES = 2560
 _MIN_SEG_SAMPLES = 7200      # 0.45s
 _MIN_BUCKET_SAMPLES = 7680   # 0.48s = 48 frames
 _MAX_BUCKET_SAMPLES = 64000  # 4.00s = 400 frames（4秒语音已完全满足声纹精度，杜绝超长句显存暴涨）
-# 单次 GPU 前向的总帧数预算（6144 帧 ≈ 64×0.96s），长句自动缩减 Batch，单进程显存恒定 < 1GB
+# 单播粗粒度定长桶（仅 5 种固定帧长：80/120/180/260/360 帧），消除 23 桶碎片化与 cuDNN 反复搜参
+_SOLO_BUCKET_SAMPLES = (12800, 19200, 28800, 41600, 57600)
+# 单次 GPU 前向的总帧数预算（双模型 6144 帧，仅 CAM++ 单播模式 16384 帧），单进程显存恒定 < 1GB
 _MAX_GPU_FRAMES_PER_BATCH = 6144
+_MAX_GPU_FRAMES_PER_BATCH_CAMP_ONLY = 16384
+# 固定尾批档位，避免每场录播出现不同的余数 Batch 大小反复触发 cuDNN 卷积算法搜索
+_FIXED_TAIL_BATCH_SIZES = (8, 16, 32, 64, 128, 256)
 
 
 def is_voiceprint_cuda_available() -> bool:
@@ -71,6 +76,7 @@ def _snap_audio_bounds(
     sr: int,
     *,
     quantize_step: int = _BUCKET_STEP_SAMPLES,
+    bucket_samples: Optional[Sequence[int]] = None,
 ) -> Tuple[int, int]:
     """将请求音频区间按中心对称对齐到固定帧桶长度，保证同桶样本精确等长且零填充."""
     if total_samples <= 0 or sr <= 0:
@@ -80,13 +86,24 @@ def _snap_audio_bounds(
     raw_len = i1 - i0
     if raw_len < int(0.45 * sr):
         return i0, i1
-    if sr != 16000 or quantize_step <= 0:
+    if sr != 16000:
         return i0, i1
 
-    target = int(round(raw_len / quantize_step)) * quantize_step
-    target = max(_MIN_BUCKET_SAMPLES, min(_MAX_BUCKET_SAMPLES, target))
-    if target > total_samples:
-        return 0, total_samples
+    if bucket_samples:
+        target = int(min(bucket_samples, key=lambda b: abs(int(b) - raw_len)))
+        if target > total_samples:
+            smaller = [int(b) for b in bucket_samples if int(b) <= total_samples]
+            if smaller:
+                target = max(smaller)
+            else:
+                return 0, total_samples
+    else:
+        if quantize_step <= 0:
+            return i0, i1
+        target = int(round(raw_len / quantize_step)) * quantize_step
+        target = max(_MIN_BUCKET_SAMPLES, min(_MAX_BUCKET_SAMPLES, target))
+        if target > total_samples:
+            return 0, total_samples
 
     center = (i0 + i1) // 2
     s = center - target // 2
@@ -415,7 +432,13 @@ class VoiceprintEngine:
         self.device = "cpu"
         self.backend = f"sherpa-onnx (CPU, threads={max(1, int(num_threads))})"
 
-    def _compute_fbank_pair(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def _compute_fbank_pair(
+        self,
+        seg: np.ndarray,
+        sr: int,
+        *,
+        need_wesp: bool = True,
+    ) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
         """提取与 sherpa-onnx 位级对齐的 80 维 Kaldi Fbank（cos >= 0.9999）."""
         assert self._knf is not None and self._fbank_opts is not None
         opts = self._fbank_opts
@@ -436,17 +459,24 @@ class VoiceprintEngine:
             return None
         fw = np.stack([fb.get_frame(i) for i in range(n_frames)], axis=0).astype(np.float32)
         fc = fw - fw.mean(axis=0, keepdims=True)
-        return fc, fw
+        return fc, (fw if need_wesp else None)
 
-    def _extract_pair_cpu(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def _extract_pair_cpu(
+        self,
+        seg: np.ndarray,
+        sr: int,
+        *,
+        need_wesp: bool = True,
+    ) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
         if len(seg) < int(0.45 * sr):
             return None
         if float(np.sqrt(np.mean(seg * seg) + 1e-12)) < 0.004:
             return None
         seg_list = seg.tolist()
 
+        extractors = (self._ex_camp, self._ex_wesp) if need_wesp else (self._ex_camp,)
         vecs: List[np.ndarray] = []
-        for ex in (self._ex_camp, self._ex_wesp):
+        for ex in extractors:
             assert ex is not None
             st = ex.create_stream()
             st.accept_waveform(sr, seg_list)
@@ -459,47 +489,69 @@ class VoiceprintEngine:
                 return None
             vecs.append(v / nrm)
 
-        vc, vw = vecs[0], vecs[1]
+        vc = vecs[0]
+        if not need_wesp:
+            return vc, None
+        vw = vecs[1]
         vj = _l2_norm(np.concatenate([self.w_camp * vc, self.w_wesp * vw]).astype(np.float32))
         return vc, vj
 
-    def _extract_pair(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def _extract_pair(self, seg: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
         if self.device == "cuda":
             return self.extract_pairs_batch([seg], sr)[0]
         return self._extract_pair_cpu(seg, sr)
 
     def _run_gpu_chunk(
         self,
-        chunk: List[Tuple[int, np.ndarray, np.ndarray]],
-        out: List[Optional[Tuple[np.ndarray, np.ndarray]]],
+        chunk: List[Tuple[int, np.ndarray, Optional[np.ndarray]]],
+        out: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]],
+        *,
+        need_wesp: bool = True,
+        pad_to: Optional[int] = None,
     ) -> None:
         """执行单个等长 GPU Batch 前向，若极端情况触发显存不足自动折半重试."""
-        assert self._ort_camp is not None and self._ort_wesp is not None
+        assert self._ort_camp is not None
+        if need_wesp:
+            assert self._ort_wesp is not None
         if not chunk:
             return
+        real_n = len(chunk)
+        run_items = chunk
+        if pad_to is not None and pad_to > real_n:
+            run_items = [*chunk, *([chunk[-1]] * (pad_to - real_n))]
         try:
-            batch_c = np.stack([it[1] for it in chunk], axis=0)
-            batch_w = np.stack([it[2] for it in chunk], axis=0)
+            batch_c = np.stack([it[1] for it in run_items], axis=0)
             raw_c = np.asarray(
-                self._ort_camp.run(None, {self._ort_camp_in: batch_c})[0],
+                self._ort_camp.run(None, {self._ort_camp_in: batch_c})[0][:real_n],
                 dtype=np.float32,
             )
-            raw_w = np.asarray(
-                self._ort_wesp.run(None, {self._ort_wesp_in: batch_w})[0],
-                dtype=np.float32,
-            )
+            raw_w: Optional[np.ndarray] = None
+            if need_wesp:
+                assert self._ort_wesp is not None
+                batch_w = np.stack([it[2] for it in run_items], axis=0)  # type: ignore[arg-type]
+                raw_w = np.asarray(
+                    self._ort_wesp.run(None, {self._ort_wesp_in: batch_w})[0][:real_n],
+                    dtype=np.float32,
+                )
         except Exception as exc:
             msg = str(exc)
-            if len(chunk) > 1 and ("BFCArena" in msg or "AllocateRaw" in msg or "out of memory" in msg.lower()):
-                mid = len(chunk) // 2
-                self._run_gpu_chunk(chunk[:mid], out)
-                self._run_gpu_chunk(chunk[mid:], out)
+            if real_n > 1 and ("BFCArena" in msg or "AllocateRaw" in msg or "out of memory" in msg.lower()):
+                mid = real_n // 2
+                self._run_gpu_chunk(chunk[:mid], out, need_wesp=need_wesp)
+                self._run_gpu_chunk(chunk[mid:], out, need_wesp=need_wesp)
                 return
             raise
 
         norms_c = np.linalg.norm(raw_c, axis=-1, keepdims=True)
-        norms_w = np.linalg.norm(raw_w, axis=-1, keepdims=True)
         vcs = raw_c / np.maximum(norms_c, 1e-8)
+        if not need_wesp or raw_w is None:
+            for local_i, (orig_idx, _, _) in enumerate(chunk):
+                if float(norms_c[local_i, 0]) <= 1e-8:
+                    continue
+                out[orig_idx] = (vcs[local_i], None)
+            return
+
+        norms_w = np.linalg.norm(raw_w, axis=-1, keepdims=True)
         vws = raw_w / np.maximum(norms_w, 1e-8)
         vjs = _l2_norm(
             np.concatenate([self.w_camp * vcs, self.w_wesp * vws], axis=-1).astype(np.float32)
@@ -511,52 +563,69 @@ class VoiceprintEngine:
 
     def _flush_gpu_buckets(
         self,
-        buckets: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]],
-        out: List[Optional[Tuple[np.ndarray, np.ndarray]]],
+        buckets: Dict[int, List[Tuple[int, np.ndarray, Optional[np.ndarray]]]],
+        out: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]],
+        *,
+        need_wesp: bool = True,
     ) -> None:
-        """按固定总帧预算动态限制每批 Batch 大小，杜绝长句触发 Conv 显存暴涨."""
+        """按固定总帧预算与档位化尾批执行前向，避免碎 Batch 与 cuDNN 反复搜参."""
+        frame_budget = (
+            _MAX_GPU_FRAMES_PER_BATCH if need_wesp else _MAX_GPU_FRAMES_PER_BATCH_CAMP_ONLY
+        )
         for t_frames, items in buckets.items():
-            eff_bs = max(1, min(self.batch_size, _MAX_GPU_FRAMES_PER_BATCH // max(1, int(t_frames))))
+            eff_bs = max(1, min(self.batch_size, frame_budget // max(1, int(t_frames))))
             for off in range(0, len(items), eff_bs):
-                self._run_gpu_chunk(items[off : off + eff_bs], out)
+                sub = items[off : off + eff_bs]
+                pad_to: Optional[int] = None
+                if len(sub) < eff_bs:
+                    for cand_bs in _FIXED_TAIL_BATCH_SIZES:
+                        if cand_bs >= len(sub):
+                            pad_to = min(eff_bs, cand_bs)
+                            break
+                    if pad_to is None:
+                        pad_to = eff_bs
+                self._run_gpu_chunk(sub, out, need_wesp=need_wesp, pad_to=pad_to)
         buckets.clear()
 
     def extract_pairs_batch(
         self,
         segments: Sequence[np.ndarray],
         sr: int,
-    ) -> List[Optional[Tuple[np.ndarray, np.ndarray]]]:
+        *,
+        need_wesp: bool = True,
+    ) -> List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]]:
         """按帧长分桶执行无填充 GPU 批量声纹提取（自动流式分波，内存恒定低占用）."""
-        out: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * len(segments)
+        out: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = [None] * len(segments)
         if not segments:
             return out
 
         if self.device != "cuda":
             for idx, seg in enumerate(segments):
-                out[idx] = self._extract_pair_cpu(seg, sr)
+                out[idx] = self._extract_pair_cpu(seg, sr, need_wesp=need_wesp)
             return out
 
         min_len = int(0.45 * sr)
-        buckets: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]] = {}
+        flush_limit = 1536 if need_wesp else 3072
+        buckets: Dict[int, List[Tuple[int, np.ndarray, Optional[np.ndarray]]]] = {}
         buffered = 0
         for idx, seg in enumerate(segments):
             if len(seg) < min_len:
                 continue
             if float(np.sqrt(np.mean(seg * seg) + 1e-12)) < 0.004:
                 continue
-            pair_fb = self._compute_fbank_pair(seg, sr)
+            pair_fb = self._compute_fbank_pair(seg, sr, need_wesp=need_wesp)
             if pair_fb is None:
                 continue
             fc, fw = pair_fb
             t_frames = int(fc.shape[0])
             buckets.setdefault(t_frames, []).append((idx, fc, fw))
             buffered += 1
-            if buffered >= 1536:
-                self._flush_gpu_buckets(buckets, out)
+            if buffered >= flush_limit:
+                self._flush_gpu_buckets(buckets, out, need_wesp=need_wesp)
                 buffered = 0
 
         if buffered > 0:
-            self._flush_gpu_buckets(buckets, out)
+            self._flush_gpu_buckets(buckets, out, need_wesp=need_wesp)
         return out
 
     def extract_spans_batch(
@@ -564,9 +633,11 @@ class VoiceprintEngine:
         fetch_seg: Callable[[int, int], np.ndarray],
         spans: Sequence[Tuple[int, int]],
         sr: int,
-    ) -> List[Optional[Tuple[np.ndarray, np.ndarray]]]:
+        *,
+        need_wesp: bool = True,
+    ) -> List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]]:
         """流式按 (i0, i1) 区间读取切片并分波送入 GPU，不常驻整片音频或数千帧特征."""
-        out: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * len(spans)
+        out: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = [None] * len(spans)
         if not spans:
             return out
 
@@ -575,10 +646,11 @@ class VoiceprintEngine:
             for idx, (i0, i1) in enumerate(spans):
                 if i1 - i0 < min_len:
                     continue
-                out[idx] = self._extract_pair_cpu(fetch_seg(i0, i1), sr)
+                out[idx] = self._extract_pair_cpu(fetch_seg(i0, i1), sr, need_wesp=need_wesp)
             return out
 
-        buckets: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]] = {}
+        flush_limit = 1536 if need_wesp else 3072
+        buckets: Dict[int, List[Tuple[int, np.ndarray, Optional[np.ndarray]]]] = {}
         buffered = 0
         for idx, (i0, i1) in enumerate(spans):
             if i1 - i0 < min_len:
@@ -588,25 +660,25 @@ class VoiceprintEngine:
                 continue
             if float(np.sqrt(np.mean(seg * seg) + 1e-12)) < 0.004:
                 continue
-            pair_fb = self._compute_fbank_pair(seg, sr)
+            pair_fb = self._compute_fbank_pair(seg, sr, need_wesp=need_wesp)
             if pair_fb is None:
                 continue
             fc, fw = pair_fb
             t_frames = int(fc.shape[0])
             buckets.setdefault(t_frames, []).append((idx, fc, fw))
             buffered += 1
-            if buffered >= 1536:
-                self._flush_gpu_buckets(buckets, out)
+            if buffered >= flush_limit:
+                self._flush_gpu_buckets(buckets, out, need_wesp=need_wesp)
                 buffered = 0
 
         if buffered > 0:
-            self._flush_gpu_buckets(buckets, out)
+            self._flush_gpu_buckets(buckets, out, need_wesp=need_wesp)
         return out
 
     def score_window(
         self,
         vc: np.ndarray,
-        vj: np.ndarray,
+        vj: Optional[np.ndarray],
         candidates: Sequence[str],
     ) -> Tuple[str, List[str], bool, float, float]:
         """返回 (label, speakers, is_overlap, top1_cos, top1_prob)."""
@@ -628,6 +700,7 @@ class VoiceprintEngine:
                 return NON_MEMBER_LABEL, [], False, c_sc, 1.0 - c_sc
             return only, [only], False, c_sc, min(0.99, max(0.5, c_sc + 0.25))
 
+        assert vj is not None
         lg = (vj @ self.W + self.b)[cidx].astype(np.float64)
         lg -= lg.max()
         p = np.exp(lg)
@@ -674,11 +747,20 @@ class VoiceprintEngine:
         )
         total_audio_sec = total_samples / float(sr) if sr > 0 else 0.0
         use_snap = self.device == "cuda"
+        solo_only = len(cands) <= 1
+        need_wesp = not solo_only
+        solo_buckets = _SOLO_BUCKET_SAMPLES if solo_only else None
 
         def _bounds(ws: float, we: float) -> Tuple[int, int]:
             we_c = min(we, total_audio_sec)
             if use_snap:
-                return _snap_audio_bounds(ws, we_c, total_samples, sr)
+                return _snap_audio_bounds(
+                    ws,
+                    we_c,
+                    total_samples,
+                    sr,
+                    bucket_samples=solo_buckets,
+                )
             return max(0, int(ws * sr)), min(total_samples, int(we_c * sr))
 
         # Phase 1: 仅收集 (i0, i1) 整数区间，流式读片分波送 GPU，不占用整片内存
@@ -714,7 +796,9 @@ class VoiceprintEngine:
                 phase1_spans.append(_bounds(ws, we))
             line_plans.append(("multi", w_indices))
 
-        phase1_pairs = self.extract_spans_batch(fetch_seg, phase1_spans, sr)
+        phase1_pairs = self.extract_spans_batch(
+            fetch_seg, phase1_spans, sr, need_wesp=need_wesp
+        )
 
         raw_results: List[Tuple[int, float, float, str, float]] = [
             (sid, s0, e0, "", 0.0) for sid, s0, e0, _ in subtitles
@@ -775,7 +859,9 @@ class VoiceprintEngine:
 
         # Phase 2: 仅对滑窗未达成高置信投票的少量长句，整句流式批量回退识别一次
         if fallback_spans:
-            fb_pairs = self.extract_spans_batch(fetch_seg, fallback_spans, sr)
+            fb_pairs = self.extract_spans_batch(
+                fetch_seg, fallback_spans, sr, need_wesp=need_wesp
+            )
             for line_idx, pair in zip(fallback_line_indices, fb_pairs):
                 if pair is None:
                     continue

@@ -441,7 +441,11 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
 
     # 4. 声纹发言人先验、分桶对齐、精准发言人过滤、以及纯声纹云端轻量补丁校验
     from zhijiang_corpus.sync_delta import apply_speakers, export_speakers
-    from zhijiang_corpus.voiceprint import _snap_audio_bounds, active_candidates_for_video
+    from zhijiang_corpus.voiceprint import (
+        _SOLO_BUCKET_SAMPLES,
+        _snap_audio_bounds,
+        active_candidates_for_video,
+    )
 
     assert "心宜" not in active_candidates_for_video(up_name="嘉然", pub_date="2022-08-01", scene_type="group")
     assert "向晚" not in active_candidates_for_video(up_name="嘉然", pub_date="2026-08-01", scene_type="group")
@@ -449,6 +453,52 @@ def test_fastapi_endpoints_public_and_admin_separation(tmp_path: Path) -> None:
     assert active_candidates_for_video(up_name="心宜", pub_date="2026-08-09", scene_type="duo", title="【双人电台】") == ["心宜", "思诺"]
     s0, e0 = _snap_audio_bounds(10.0, 10.95, 320000, 16000)
     assert e0 - s0 == 15360  # 0.95s 精确对齐到 96 帧桶 (0.96s)
+    # 校验单播 5 档粗桶对齐（防止单播炸出 23 种帧长桶导致 cuDNN 反复搜参）
+    for dur_s in (0.6, 1.3, 2.0, 2.8, 4.5):
+        ss, ee = _snap_audio_bounds(
+            5.0, 5.0 + dur_s, 320000, 16000, bucket_samples=_SOLO_BUCKET_SAMPLES
+        )
+        assert (ee - ss) in _SOLO_BUCKET_SAMPLES
+
+    # 校验单播 CAM++-only 路径：跳过 WeSpeaker 前向 + 尾批档位填充后截断至真实样本数
+    import numpy as np
+    from zhijiang_corpus.voiceprint import VoiceprintEngine
+
+    class _DummyCamp:
+        def __init__(self) -> None:
+            self.seen_shapes: List[tuple[int, ...]] = []
+
+        def run(self, _out_names: Any, feed: Dict[str, Any]) -> List[np.ndarray]:
+            arr = next(iter(feed.values()))
+            self.seen_shapes.append(tuple(arr.shape))
+            # 返回按每条样本特征均值生成的非零单位向量，验证填充位不会污染真实样本
+            b = arr.shape[0]
+            out = np.zeros((b, 4), dtype=np.float32)
+            out[:, 0] = arr.mean(axis=(1, 2)) + 1.0
+            out[:, 1] = 1.0
+            return [out]
+
+    class _FailWesp:
+        def run(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("单播 need_wesp=False 不应调用 WeSpeaker 前向")
+
+    dummy_eng = object.__new__(VoiceprintEngine)
+    dummy_eng.batch_size = 64
+    dummy_eng.w_camp = 0.75
+    dummy_eng.w_wesp = 0.25
+    dummy_eng._ort_camp = _DummyCamp()
+    dummy_eng._ort_wesp = _FailWesp()
+    dummy_eng._ort_camp_in = "x"
+    dummy_eng._ort_wesp_in = "feats"
+
+    out_slots: List[Any] = [None] * 5
+    buckets = {
+        120: [(i, np.full((120, 80), float(i + 1), dtype=np.float32), None) for i in range(5)]
+    }
+    dummy_eng._flush_gpu_buckets(buckets, out_slots, need_wesp=False)
+    assert dummy_eng._ort_camp.seen_shapes == [(8, 120, 80)]  # 5 条尾批对齐至固定档位 8
+    assert all(slot is not None and slot[1] is None for slot in out_slots)
+    assert np.allclose(np.linalg.norm(out_slots[0][0]), 1.0, atol=1e-5)
 
     vp_st = loc_client.get("/api/v1/admin/voiceprint/status").json()
     assert "progress" in vp_st and "job" in vp_st
